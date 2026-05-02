@@ -1,0 +1,136 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL 16 ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentinel-postgres
+    environment:
+      POSTGRES_DB: sentinel_db
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel_dev_2026
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Redis 7 ────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: sentinel-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── MinIO (S3-compatible object storage) ───────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: sentinel-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: sentinel_admin
+      MINIO_ROOT_PASSWORD: sentinel_minio_2026
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── MinIO bucket initialization ────────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: sentinel-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set sentinel http://minio:9000 sentinel_admin sentinel_minio_2026;
+      mc mb sentinel/sentinel-payloads --ignore-existing;
+      mc anonymous set download sentinel/sentinel-payloads;
+      echo 'Bucket sentinel-payloads created successfully';
+      "
+
+  # ── FastAPI Backend ────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinel-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sentinel:sentinel_dev_2026@postgres:5432/sentinel_db
+      DATABASE_URL_SYNC: postgresql://sentinel:sentinel_dev_2026@postgres:5432/sentinel_db
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: sentinel_admin
+      MINIO_SECRET_KEY: sentinel_minio_2026
+      MINIO_BUCKET: sentinel-payloads
+      MINIO_SECURE: "false"
+    volumes:
+      - ./backend/app:/app/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  # ── Celery Worker ──────────────────────────────────────────────
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinel-celery-worker
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sentinel:sentinel_dev_2026@postgres:5432/sentinel_db
+      DATABASE_URL_SYNC: postgresql://sentinel:sentinel_dev_2026@postgres:5432/sentinel_db
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: sentinel_admin
+      MINIO_SECRET_KEY: sentinel_minio_2026
+      MINIO_BUCKET: sentinel-payloads
+      MINIO_SECURE: "false"
+    volumes:
+      - ./backend/app:/app/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Celery Flower (Monitoring) ─────────────────────────────────
+  celery-flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sentinel-flower
+    command: celery -A app.worker.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  miniodata:
