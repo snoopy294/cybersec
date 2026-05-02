@@ -27,7 +27,7 @@ from app.schemas.schemas import (
     ThreatReportResponse, HealthResponse,
     UserRegister, UserLogin, TokenResponse,
 )
-from app.services.file_service import compute_file_hashes, upload_to_minio
+from app.services.file_service import compute_file_hashes, upload_file as store_file
 from app.services.auth_service import hash_password, verify_password, create_access_token
 
 settings = get_settings()
@@ -156,8 +156,8 @@ async def upload_file(
         db.add(tenant)
         await db.flush()
 
-    # Upload to MinIO
-    object_path = upload_to_minio(
+    # Store file (local filesystem or MinIO depending on config)
+    object_path = store_file(
         tenant_id=str(tenant.id),
         sha256_hash=hashes["sha256"],
         file_name=file.filename or "unknown",
@@ -180,9 +180,9 @@ async def upload_file(
     db.add(job)
     await db.flush()
 
-    # Dispatch Celery task
-    from app.worker import analyze_file
-    analyze_file.delay(str(job.id))
+    # Dispatch analysis (background thread or Celery)
+    from app.worker import dispatch_analysis
+    dispatch_analysis(str(job.id))
 
     return AnalysisJobResponse(
         job_id=job.id,

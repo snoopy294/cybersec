@@ -2,20 +2,60 @@
 
 Defines the core data entities: Tenant, User, AnalysisJob, and ThreatReport.
 These map directly to the schemas defined in the architecture specification.
+
+Compatible with both SQLite (local dev) and PostgreSQL (production).
 """
 
 import uuid
 import enum
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import (
     Column, String, Integer, BigInteger, Text, Enum, ForeignKey,
-    DateTime, Boolean, Index
+    DateTime, Boolean, Index, TypeDecorator, types
 )
-from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+
+
+# ── Cross-DB Compatible Types ────────────────────────────────────
+
+class GUID(TypeDecorator):
+    """Platform-independent GUID type.
+    Uses String(36) on SQLite, native UUID on PostgreSQL.
+    """
+    impl = String(36)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None:
+            return str(value)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None:
+            return uuid.UUID(value) if not isinstance(value, uuid.UUID) else value
+        return value
+
+
+class JSONType(TypeDecorator):
+    """Platform-independent JSON type.
+    Uses TEXT with JSON serialization on SQLite, native JSONB on PostgreSQL.
+    """
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None:
+            return json.dumps(value)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None:
+            return json.loads(value)
+        return value
 
 
 # ── Enums ────────────────────────────────────────────────────────
@@ -64,10 +104,10 @@ def _uuid():
 class Tenant(Base):
     __tablename__ = "tenants"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    id = Column(GUID(), primary_key=True, default=_uuid)
     name = Column(String(255), nullable=False)
-    tier = Column(Enum(TenantTier), nullable=False, default=TenantTier.FREE)
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    tier = Column(String(20), nullable=False, default=TenantTier.FREE.value)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
 
     # Relationships
     users = relationship("User", back_populates="tenant", cascade="all, delete-orphan")
@@ -77,32 +117,30 @@ class Tenant(Base):
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    id = Column(GUID(), primary_key=True, default=_uuid)
+    tenant_id = Column(GUID(), ForeignKey("tenants.id"), nullable=False)
     email = Column(String(320), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
-    role = Column(Enum(UserRole), nullable=False, default=UserRole.ANALYST)
+    role = Column(String(20), nullable=False, default=UserRole.ANALYST.value)
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
 
     # Relationships
     tenant = relationship("Tenant", back_populates="users")
-
-    # API keys
     api_keys = relationship("ApiKey", back_populates="user", cascade="all, delete-orphan")
 
 
 class ApiKey(Base):
     __tablename__ = "api_keys"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    id = Column(GUID(), primary_key=True, default=_uuid)
+    user_id = Column(GUID(), ForeignKey("users.id"), nullable=False)
     key_hash = Column(String(255), nullable=False, unique=True)
-    prefix = Column(String(12), nullable=False)  # e.g. "stl_live_xxxx" for display
+    prefix = Column(String(12), nullable=False)
     name = Column(String(100), nullable=False, default="Default")
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
-    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    last_used_at = Column(DateTime, nullable=True)
 
     # Relationships
     user = relationship("User", back_populates="api_keys")
@@ -110,25 +148,21 @@ class ApiKey(Base):
 
 class AnalysisJob(Base):
     __tablename__ = "analysis_jobs"
-    __table_args__ = (
-        Index("ix_analysis_jobs_hash", "file_hash_sha256"),
-        Index("ix_analysis_jobs_status", "status"),
-    )
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    id = Column(GUID(), primary_key=True, default=_uuid)
+    tenant_id = Column(GUID(), ForeignKey("tenants.id"), nullable=False)
     file_name = Column(String(512), nullable=False)
     file_size_bytes = Column(BigInteger, nullable=False)
-    file_hash_sha256 = Column(String(64), nullable=False)
+    file_hash_sha256 = Column(String(64), nullable=False, index=True)
     file_hash_sha1 = Column(String(40), nullable=True)
     file_hash_md5 = Column(String(32), nullable=True)
     file_mime_type = Column(String(128), nullable=True)
-    status = Column(Enum(JobStatus), nullable=False, default=JobStatus.QUEUED)
+    status = Column(String(20), nullable=False, default=JobStatus.QUEUED.value)
     minio_object_path = Column(String(1024), nullable=False)
     error_message = Column(Text, nullable=True)
     progress_percent = Column(Integer, default=0, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
-    completed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
 
     # Relationships
     tenant = relationship("Tenant", back_populates="jobs")
@@ -138,18 +172,18 @@ class AnalysisJob(Base):
 class ThreatReport(Base):
     __tablename__ = "threat_reports"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    job_id = Column(UUID(as_uuid=True), ForeignKey("analysis_jobs.id"), unique=True, nullable=False)
+    id = Column(GUID(), primary_key=True, default=_uuid)
+    job_id = Column(GUID(), ForeignKey("analysis_jobs.id"), unique=True, nullable=False)
     file_hash_sha256 = Column(String(64), nullable=False, index=True)
     severity_score = Column(Integer, default=0, nullable=False)  # 0-100
-    verdict = Column(Enum(Verdict), nullable=False, default=Verdict.UNKNOWN)
+    verdict = Column(String(20), nullable=False, default=Verdict.UNKNOWN.value)
     ai_narrative = Column(Text, nullable=True)
     ai_available = Column(Boolean, default=False, nullable=False)
-    static_data = Column(JSONB, nullable=True)   # PE headers, strings, entropy, YARA
-    dynamic_data = Column(JSONB, nullable=True)   # syscalls, network, behavior
-    mitre_mappings = Column(JSONB, nullable=True)  # ATT&CK technique IDs
-    iocs = Column(JSONB, nullable=True)            # IPs, domains, URLs, hashes
-    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    static_data = Column(JSONType(), nullable=True)   # PE headers, strings, entropy
+    dynamic_data = Column(JSONType(), nullable=True)   # syscalls, network, behavior
+    mitre_mappings = Column(JSONType(), nullable=True)  # ATT&CK technique IDs
+    iocs = Column(JSONType(), nullable=True)            # IPs, domains, URLs, hashes
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
 
     # Relationships
     job = relationship("AnalysisJob", back_populates="report")

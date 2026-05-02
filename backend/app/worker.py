@@ -1,55 +1,41 @@
-"""SENTINEL — Celery worker for asynchronous analysis pipeline.
+"""SENTINEL — Analysis engine.
 
-This worker processes files through the analysis pipeline:
-  QUEUED → ANALYZING (static) → CORTEX_REASONING → COMPLETED
+Runs static analysis on uploaded files:
+  - PE header extraction
+  - String extraction with IOC classification
+  - Shannon entropy computation
+  - Automated threat scoring
+
+Supports two modes:
+  - Synchronous (default): Runs in a background thread, no Redis/Celery needed
+  - Celery (optional): Distributed via Redis broker
 """
 
-import time
 import re
 import struct
+import threading
 from datetime import datetime, timezone
-from celery import Celery
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import get_settings
-from app.services.file_service import download_from_minio
+from app.services.file_service import download_file
 
 settings = get_settings()
 
-# ── Celery App ───────────────────────────────────────────────────
-
-celery_app = Celery(
-    "sentinel",
-    broker=settings.REDIS_URL,
-    backend=settings.REDIS_URL,
-)
-
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    timezone="UTC",
-    enable_utc=True,
-    task_track_started=True,
-    task_acks_late=True,
-    worker_prefetch_multiplier=1,
-)
-
-# Synchronous DB session for Celery (can't use async in Celery tasks)
-sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
+# Synchronous DB session for the analysis worker
+sync_engine = create_engine(settings.DATABASE_URL_SYNC, connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL_SYNC else {})
 SyncSession = sessionmaker(bind=sync_engine)
 
 
 # ── Static Analysis Helpers ──────────────────────────────────────
 
 def _extract_strings(data: bytes, min_length: int = 4) -> list[dict]:
-    """Extract ASCII and Unicode strings from binary data."""
+    """Extract ASCII strings from binary data."""
     results = []
-
-    # ASCII strings
     ascii_pattern = re.compile(rb'[\x20-\x7e]{%d,}' % min_length)
-    for match in ascii_pattern.finditer(data[:500000]):  # Limit to first 500KB for speed
+    for match in ascii_pattern.finditer(data[:500000]):  # First 500KB
         value = match.group().decode('ascii', errors='ignore')
         classification = _classify_string(value)
         results.append({
@@ -58,7 +44,6 @@ def _extract_strings(data: bytes, min_length: int = 4) -> list[dict]:
             "offset": match.start(),
             "classification": classification,
         })
-
     return results[:500]  # Cap at 500 strings
 
 
@@ -98,7 +83,7 @@ def _analyze_pe_headers(data: bytes) -> dict | None:
             "machine": machine_names.get(machine, f"0x{machine:04x}"),
             "num_sections": num_sections,
             "compile_timestamp": timestamp,
-            "compile_date": datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat() if timestamp > 0 else None,
+            "compile_date": datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat() if 0 < timestamp < 2000000000 else None,
             "file_size": len(data),
         }
     except (struct.error, ValueError):
@@ -122,38 +107,35 @@ def _compute_entropy(data: bytes) -> float:
     return round(entropy, 4)
 
 
-# ── Main Analysis Task ───────────────────────────────────────────
+# ── Core Analysis Function ───────────────────────────────────────
 
-@celery_app.task(bind=True, name="sentinel.analyze_file", max_retries=3)
-def analyze_file(self, job_id: str):
+def run_analysis(job_id: str):
     """Process a file through the static analysis pipeline.
 
-    Pipeline stages:
-      1. Download file from MinIO
-      2. Static analysis (PE headers, strings, entropy)
-      3. Generate preliminary threat assessment
-      4. Save report to database
+    This function runs synchronously and is designed to be called
+    either directly in a background thread or via Celery.
     """
     from app.models.models import AnalysisJob, ThreatReport, JobStatus, Verdict
 
     session = SyncSession()
     try:
-        # Fetch the job
         job = session.query(AnalysisJob).filter_by(id=job_id).first()
         if not job:
+            print(f"[SENTINEL] Job {job_id} not found")
             return {"error": f"Job {job_id} not found"}
 
         # ── Stage 1: Update status ───────────────────────────────
         job.status = JobStatus.ANALYZING
         job.progress_percent = 10
         session.commit()
+        print(f"[SENTINEL] Analyzing: {job.file_name}")
 
-        # ── Stage 2: Download file from MinIO ────────────────────
+        # ── Stage 2: Download file ───────────────────────────────
         try:
-            file_data = download_from_minio(job.minio_object_path)
+            file_data = download_file(job.minio_object_path)
         except Exception as e:
             job.status = JobStatus.FAILED
-            job.error_message = f"Failed to download file from storage: {str(e)}"
+            job.error_message = f"Failed to read file: {str(e)}"
             session.commit()
             return {"error": str(e)}
 
@@ -180,16 +162,14 @@ def analyze_file(self, job_id: str):
         job.status = JobStatus.CORTEX_REASONING
         session.commit()
 
-        # ── Stage 4: Preliminary threat scoring ──────────────────
+        # ── Stage 4: Threat scoring ──────────────────────────────
         score = 0
         reasons = []
 
-        # High entropy = likely packed/encrypted
         if entropy > 7.0:
             score += 30
             reasons.append("High entropy suggests packed or encrypted content")
 
-        # Suspicious IOCs
         url_count = len([s for s in ioc_strings if s["classification"] == "URL"])
         ip_count = len([s for s in ioc_strings if s["classification"] == "IP_ADDRESS"])
         reg_count = len([s for s in ioc_strings if s["classification"] == "REGISTRY_KEY"])
@@ -204,16 +184,14 @@ def analyze_file(self, job_id: str):
             score += min(reg_count * 10, 20)
             reasons.append(f"References {reg_count} registry key(s)")
 
-        # PE-specific scoring
         if pe_info and pe_info.get("is_pe"):
-            score += 5  # PE files are inherently higher risk
+            score += 5
             if pe_info.get("num_sections", 0) > 8:
                 score += 10
                 reasons.append("Unusual number of PE sections")
 
         score = min(score, 100)
 
-        # Determine verdict
         if score >= 70:
             verdict = Verdict.MALICIOUS
         elif score >= 30:
@@ -221,6 +199,7 @@ def analyze_file(self, job_id: str):
         else:
             verdict = Verdict.BENIGN
 
+        # ── Generate narrative ───────────────────────────────────
         narrative = f"## Automated Static Analysis Report\n\n"
         narrative += f"**File:** {job.file_name}\n"
         narrative += f"**SHA-256:** `{job.file_hash_sha256}`\n"
@@ -261,7 +240,7 @@ def analyze_file(self, job_id: str):
             severity_score=score,
             verdict=verdict,
             ai_narrative=narrative,
-            ai_available=False,  # Will be True when Cortex LLM is integrated
+            ai_available=False,
             static_data=static_data,
             iocs=iocs_dict,
         )
@@ -272,16 +251,11 @@ def analyze_file(self, job_id: str):
         job.completed_at = datetime.now(timezone.utc)
         session.commit()
 
-        return {
-            "job_id": job_id,
-            "verdict": verdict.value,
-            "severity_score": score,
-            "status": "COMPLETED",
-        }
+        print(f"[SENTINEL] ✅ Complete: {job.file_name} → {verdict.value} (score: {score})")
+        return {"job_id": job_id, "verdict": verdict.value, "severity_score": score}
 
     except Exception as e:
         session.rollback()
-        # Try to mark job as failed
         try:
             job = session.query(AnalysisJob).filter_by(id=job_id).first()
             if job:
@@ -290,6 +264,21 @@ def analyze_file(self, job_id: str):
                 session.commit()
         except Exception:
             pass
+        print(f"[SENTINEL] ❌ Failed: {e}")
         raise
     finally:
         session.close()
+
+
+# ── Dispatch: Background Thread (default) or Celery ──────────────
+
+def dispatch_analysis(job_id: str):
+    """Dispatch analysis — uses background thread by default, Celery if configured."""
+    if settings.USE_CELERY:
+        # Lazy import Celery task to avoid import errors when Redis isn't available
+        from app.celery_worker import analyze_file_task
+        analyze_file_task.delay(job_id)
+    else:
+        # Run in background thread (no Redis/Celery required)
+        thread = threading.Thread(target=run_analysis, args=(job_id,), daemon=True)
+        thread.start()

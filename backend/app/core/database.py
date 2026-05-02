@@ -1,4 +1,7 @@
-"""SENTINEL — Async database engine and session management."""
+"""SENTINEL — Async database engine and session management.
+
+Supports both SQLite (local dev) and PostgreSQL (production).
+"""
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
@@ -6,12 +9,15 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
+# SQLite needs special connect args for async
+connect_args = {}
+if "sqlite" in settings.DATABASE_URL:
+    connect_args = {"check_same_thread": False}
+
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=settings.DEBUG,
-    pool_size=20,
-    max_overflow=10,
-    pool_pre_ping=True,
+    echo=False,
+    connect_args=connect_args,
 )
 
 async_session = async_sessionmaker(
