@@ -185,6 +185,7 @@ async def upload_file(
     )
     db.add(job)
     await db.flush()
+    await db.commit()
 
     # Dispatch analysis (background thread or Celery)
     from app.worker import dispatch_analysis
