@@ -130,23 +130,29 @@ async def upload_file(
 
     # Compute hashes
     hashes = compute_file_hashes(file_bytes)
+    from app.worker import ANALYZER_VERSION
 
     # Check for existing completed analysis with same hash
     existing = await db.execute(
-        select(AnalysisJob).where(
+        select(AnalysisJob, ThreatReport).join(
+            ThreatReport, ThreatReport.job_id == AnalysisJob.id
+        ).where(
             AnalysisJob.file_hash_sha256 == hashes["sha256"],
             AnalysisJob.status == JobStatus.COMPLETED,
-        )
+        ).order_by(desc(AnalysisJob.completed_at))
     )
-    existing_job = existing.scalar_one_or_none()
-    if existing_job:
-        return AnalysisJobResponse(
-            job_id=existing_job.id,
-            status=existing_job.status,
-            progress_percent=100,
-            message="Analysis already completed for this file (cache hit).",
-            poll_url=f"/api/v1/analyze/{existing_job.id}",
-        )
+    existing_result = existing.first()
+    if existing_result:
+        existing_job, existing_report = existing_result
+        static_data = existing_report.static_data or {}
+        if static_data.get("analyzer_version") == ANALYZER_VERSION:
+            return AnalysisJobResponse(
+                job_id=existing_job.id,
+                status=existing_job.status,
+                progress_percent=100,
+                message="Analysis already completed for this file (cache hit).",
+                poll_url=f"/api/v1/analyze/{existing_job.id}",
+            )
 
     # Use a default tenant for now (will be replaced with auth context)
     result = await db.execute(select(Tenant).limit(1))
@@ -275,7 +281,10 @@ async def list_jobs(
 async def get_report(file_hash: str, db: AsyncSession = Depends(get_db)):
     """Get a threat report by file SHA-256 hash."""
     result = await db.execute(
-        select(ThreatReport).where(ThreatReport.file_hash_sha256 == file_hash)
+        select(ThreatReport)
+        .where(ThreatReport.file_hash_sha256 == file_hash)
+        .order_by(desc(ThreatReport.created_at))
+        .limit(1)
     )
     report = result.scalar_one_or_none()
 

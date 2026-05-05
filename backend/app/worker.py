@@ -27,6 +27,7 @@ from app.core.config import get_settings
 from app.services.file_service import download_file
 
 settings = get_settings()
+ANALYZER_VERSION = "behavior-v2"
 
 # Synchronous DB session for the analysis worker
 sync_engine = create_engine(settings.DATABASE_URL_SYNC, connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL_SYNC else {})
@@ -36,34 +37,123 @@ SyncSession = sessionmaker(bind=sync_engine)
 # ── Static Analysis Helpers ──────────────────────────────────────
 
 def _extract_strings(data: bytes, min_length: int = 4) -> list[dict]:
-    """Extract ASCII strings from binary data."""
+    """Extract ASCII and UTF-16LE strings, prioritizing behavior evidence."""
     results = []
-    ascii_pattern = re.compile(rb'[\x20-\x7e]{%d,}' % min_length)
-    for match in ascii_pattern.finditer(data[:500000]):  # First 500KB
-        value = match.group().decode('ascii', errors='ignore')
+    seen_values = set()
+    scan = data[:16 * 1024 * 1024]
+
+    def add_string(value: str, encoding: str, offset: int):
+        value = value.strip()
+        if len(value) < min_length:
+            return
+        if len(value) > 2048:
+            value = value[:2048]
+        dedupe_key = value.lower()
+        if dedupe_key in seen_values:
+            return
+        seen_values.add(dedupe_key)
         classification = _classify_string(value)
         results.append({
             "value": value,
-            "encoding": "ascii",
-            "offset": match.start(),
+            "encoding": encoding,
+            "offset": offset,
             "classification": classification,
+            "priority": _string_priority(value, classification),
         })
-    return results[:500]  # Cap at 500 strings
+
+    ascii_pattern = re.compile(rb'[\x20-\x7e]{%d,}' % min_length)
+    for match in ascii_pattern.finditer(scan):
+        add_string(match.group().decode('ascii', errors='ignore'), "ascii", match.start())
+
+    utf16_pattern = re.compile(rb'(?:[\x20-\x7e]\x00){%d,}' % min_length)
+    for match in utf16_pattern.finditer(scan):
+        add_string(match.group().decode('utf-16le', errors='ignore'), "utf-16le", match.start())
+
+    results.sort(key=lambda item: (-item["priority"], item["offset"]))
+    for item in results:
+        item.pop("priority", None)
+    return results[:5000]
 
 
 def _classify_string(s: str) -> str:
     """Classify a string as an IOC type."""
-    if re.match(r'https?://', s, re.IGNORECASE):
+    if re.search(r'https?://', s, re.IGNORECASE):
         return "URL"
-    if re.match(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', s):
+    if re.search(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', s):
         return "IP_ADDRESS"
-    if re.match(r'[^@]+@[^@]+\.[^@]+', s):
+    if re.search(r'\b[^@\s]+@[^@\s]+\.[^@\s]+\b', s):
         return "EMAIL"
-    if 'HKEY_' in s or 'SOFTWARE\\' in s:
+    if re.search(r'\b(HKEY_|HKLM\\|HKCU\\|SOFTWARE\\)', s, re.IGNORECASE):
         return "REGISTRY_KEY"
-    if re.match(r'[A-Za-z]:\\', s) or '/..' in s:
+    if re.search(r'\b[A-Za-z]:\\', s) or '/..' in s:
         return "FILE_PATH"
+    if re.search(r'\b(whoami|ipconfig|net user|schtasks|reg query|powershell|cmd\.exe)\b', s, re.IGNORECASE):
+        return "COMMAND"
+    if re.search(r'\bSe[A-Za-z]+Privilege\b', s):
+        return "WINDOWS_PRIVILEGE"
     return "UNKNOWN"
+
+
+def _string_priority(value: str, classification: str) -> int:
+    """Rank strings so report samples contain analyst-useful evidence."""
+    score = 0
+    if classification != "UNKNOWN":
+        score += 50
+
+    lowered = value.lower()
+    interesting_terms = [
+        "password", "credential", "token", "secret", "lsass", "sam", "winlogon",
+        "alwaysinstallelevated", "seimpersonate", "namedpipe", "unquoted service",
+        "currentversion\\run", "schtasks", "whoami", "ipconfig", "net user",
+        "reg query", "hkey_", "software\\microsoft\\windows", "startup",
+        "autologon", "privilege", "service", "process", "registry",
+    ]
+    score += sum(10 for term in interesting_terms if term in lowered)
+
+    for rule in BEHAVIOR_RULES.values():
+        if any(pattern.lower() in lowered for pattern in rule["patterns"]):
+            score += 15
+            break
+
+    return score
+
+
+def _extract_ioc_values(value: str, classification: str) -> list[str]:
+    """Extract normalized IOC tokens from a classified string."""
+    if classification == "URL":
+        return [
+            item.rstrip(".,;)'\"]")
+            for item in re.findall(r'https?://[^\s`"\'<>]+', value, re.IGNORECASE)
+        ]
+    if classification == "IP_ADDRESS":
+        lowered = value.lower()
+        if any(marker in lowered for marker in ("version=", "publickeytoken", "assemblyidentity")):
+            return []
+        ips = []
+        for item in re.findall(r'\b\d{1,3}(?:\.\d{1,3}){3}\b', value):
+            octets = [int(part) for part in item.split(".")]
+            if all(0 <= part <= 255 for part in octets):
+                ips.append(item)
+        return ips
+    if classification == "EMAIL":
+        return re.findall(r'\b[^@\s]+@[^@\s]+\.[^@\s]+\b', value)
+    return [value]
+
+
+def _ioc_values(strings: list[dict], classification: str) -> list[str]:
+    """Return normalized, de-duplicated IOC values by classification."""
+    values = []
+    seen = set()
+    for item in strings:
+        if item["classification"] != classification:
+            continue
+        for value in _extract_ioc_values(item["value"], classification):
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append(value)
+    return values
 
 
 def _analyze_pe_headers(data: bytes) -> dict | None:
@@ -134,7 +224,7 @@ BEHAVIOR_RULES = {
         "patterns": [
             "virtualallocex", "writeprocessmemory", "createremotethread",
             "ntmapviewofsection", "queueuserapc", "setthreadcontext",
-            "openprocess", "rtlcreateuserthread",
+            "rtlcreateuserthread",
         ],
         "mitre": ["T1055"],
         "label": "Process injection or remote memory manipulation",
@@ -151,7 +241,8 @@ BEHAVIOR_RULES = {
     "credential_access": {
         "patterns": [
             "cryptunprotectdata", "credenumerate", "lsass", "sam\\", "sekurlsa",
-            "logonpasswords", "advapi32", "vaultcli",
+            "logonpasswords", "advapi32", "vaultcli", "password", "credential",
+            "autologon", "winlogon", "dpapi", "masterkey", "vault", "secret",
         ],
         "mitre": ["T1003", "T1555"],
         "label": "Credential or secret access",
@@ -160,10 +251,20 @@ BEHAVIOR_RULES = {
         "patterns": [
             "enumprocesses", "createtoolhelp32snapshot", "process32first",
             "process32next", "getusername", "getcomputername", "systeminfo",
-            "ipconfig", "whoami", "net view",
+            "ipconfig", "whoami", "net view", "net user", "net localgroup",
         ],
         "mitre": ["T1057", "T1082", "T1033"],
         "label": "Host, user, process, or network discovery",
+    },
+    "privilege_escalation_audit": {
+        "patterns": [
+            "alwaysinstallelevated", "seimpersonateprivilege", "seassignprimaryprivilege",
+            "sebackupprivilege", "serestoreprivilege", "secreatetokenprivilege",
+            "unquoted service", "modifiable service", "namedpipe", "autologon",
+            "token manipulation",
+        ],
+        "mitre": ["T1068", "T1134"],
+        "label": "Privilege escalation or misconfiguration auditing",
     },
     "registry_modification": {
         "patterns": [
@@ -184,7 +285,7 @@ BEHAVIOR_RULES = {
     "destructive_or_ransomware": {
         "patterns": [
             "vssadmin delete shadows", "wbadmin delete", "bcdedit /set",
-            "delete shadows", ".locked", ".encrypted", "ransom", "recover your files",
+            "delete shadows", ".locked", ".encrypted", "recover your files",
         ],
         "mitre": ["T1486", "T1490"],
         "label": "Destructive, recovery-inhibiting, or ransomware-like behavior",
@@ -194,12 +295,47 @@ BEHAVIOR_RULES = {
 
 def _ioc_hosts(iocs_dict: dict) -> list[str]:
     """Normalize IOC URLs/IPs into host-like comparison tokens."""
-    hosts = set(iocs_dict.get("ips", []))
+    hosts = []
+    seen = set()
+
+    def add_host(host: str):
+        key = host.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        hosts.append(key)
+
     for url in iocs_dict.get("urls", []):
         parsed = urlparse(url)
         if parsed.hostname:
-            hosts.add(parsed.hostname.lower())
-    return sorted(hosts)
+            add_host(parsed.hostname)
+
+    for ip in iocs_dict.get("ips", []):
+        if _is_contextual_ip(ip):
+            add_host(ip)
+
+    return hosts
+
+
+def _is_contextual_ip(ip: str) -> bool:
+    """Keep IPs likely to represent network targets, not versions or OIDs."""
+    try:
+        octets = [int(part) for part in ip.split(".")]
+    except ValueError:
+        return False
+    if len(octets) != 4:
+        return False
+    if octets[0] in (0, 10, 127):
+        return True
+    if octets[0] == 172 and 16 <= octets[1] <= 31:
+        return True
+    if octets[0] == 192 and octets[1] == 168:
+        return True
+    if octets[:2] in ([8, 8], [9, 9]):
+        return True
+    if octets[0] >= 11 and ip not in {"255.255.255.255"}:
+        return True
+    return False
 
 
 def _build_behavior_profile(strings: list[dict], iocs_dict: dict, entropy: float, pe_info: dict | None) -> dict:
@@ -227,7 +363,7 @@ def _build_behavior_profile(strings: list[dict], iocs_dict: dict, entropy: float
         if name == "registry_modification" and iocs_dict.get("registry_keys"):
             evidence.extend(iocs_dict["registry_keys"][:5])
 
-        deduped = sorted(set(evidence))
+        deduped = list(dict.fromkeys(evidence))
         if deduped:
             confidence = min(0.95, 0.35 + (0.12 * len(deduped)))
             capabilities.append({
@@ -401,15 +537,18 @@ def run_analysis(job_id: str):
 
         ioc_strings = [s for s in strings if s["classification"] != "UNKNOWN"]
         iocs_dict = {
-            "urls": [s["value"] for s in ioc_strings if s["classification"] == "URL"],
-            "ips": [s["value"] for s in ioc_strings if s["classification"] == "IP_ADDRESS"],
-            "emails": [s["value"] for s in ioc_strings if s["classification"] == "EMAIL"],
-            "registry_keys": [s["value"] for s in ioc_strings if s["classification"] == "REGISTRY_KEY"],
-            "file_paths": [s["value"] for s in ioc_strings if s["classification"] == "FILE_PATH"],
+            "urls": _ioc_values(ioc_strings, "URL"),
+            "ips": _ioc_values(ioc_strings, "IP_ADDRESS"),
+            "emails": _ioc_values(ioc_strings, "EMAIL"),
+            "registry_keys": _ioc_values(ioc_strings, "REGISTRY_KEY"),
+            "file_paths": _ioc_values(ioc_strings, "FILE_PATH"),
+            "commands": _ioc_values(ioc_strings, "COMMAND"),
+            "windows_privileges": _ioc_values(ioc_strings, "WINDOWS_PRIVILEGE"),
         }
         behavior_profile = _build_behavior_profile(strings, iocs_dict, entropy, pe_info)
 
         static_data = {
+            "analyzer_version": ANALYZER_VERSION,
             "pe_headers": pe_info,
             "strings_count": len(strings),
             "strings_sample": strings[:100],
