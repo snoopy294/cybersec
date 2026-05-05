@@ -220,9 +220,9 @@ function ReportView({ reportHash, onBack }) {
 
       <div className="card">
         <div className="tabs">
-          {['summary', 'static', 'iocs'].map(tab => (
+          {['summary', 'behavior', 'static', 'iocs'].map(tab => (
             <button key={tab} className={`tab ${activeTab === tab ? 'active' : ''}`} onClick={() => setActiveTab(tab)}>
-              {tab === 'summary' ? '🤖 AI Summary' : tab === 'static' ? '🔍 Static Analysis' : '🎯 IOCs'}
+              {tab === 'summary' ? 'AI Summary' : tab === 'behavior' ? 'Behavior Graph' : tab === 'static' ? 'Static Analysis' : 'IOCs'}
             </button>
           ))}
         </div>
@@ -237,6 +237,64 @@ function ReportView({ reportHash, onBack }) {
               if (line.trim()) return <p key={i}>{line}</p>;
               return null;
             })}
+          </div>
+        )}
+
+        {activeTab === 'behavior' && report.static_data && (
+          <div>
+            {report.static_data.behavior_profile?.capabilities?.length > 0 ? (
+              <div style={{ display: 'grid', gap: 12, marginBottom: 24 }}>
+                {report.static_data.behavior_profile.capabilities.map(capability => (
+                  <div key={capability.name} className="behavior-row">
+                    <div>
+                      <div className="behavior-title">{capability.label}</div>
+                      <div className="behavior-meta">
+                        {capability.mitre?.join(', ') || 'No MITRE mapping'} · {Math.round(capability.confidence * 100)}% confidence
+                      </div>
+                    </div>
+                    <div className="behavior-evidence">
+                      {capability.evidence?.slice(0, 4).map(item => <code key={item}>{item}</code>)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state"><div className="empty-state-title">No behavior profile detected</div></div>
+            )}
+
+            <div className="behavior-section">
+              <div className="card-title" style={{ marginBottom: 12 }}>Historical Behavior Matches</div>
+              {report.static_data.cross_reference?.top_matches?.length > 0 ? (
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Similarity</th>
+                      <th>File</th>
+                      <th>Verdict</th>
+                      <th>Matched Behaviors</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.static_data.cross_reference.top_matches.map(match => (
+                      <tr key={match.file_hash_sha256}>
+                        <td style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{match.similarity_score}%</td>
+                        <td style={{ color: 'var(--text-primary)' }}>{match.file_name}</td>
+                        <td><VerdictBadge verdict={match.verdict} /></td>
+                        <td>{match.matched_behaviors?.join(', ') || 'Shared static traits'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <div className="empty-state"><div className="empty-state-title">No similar prior samples yet</div></div>
+              )}
+            </div>
+
+            {report.static_data.behavior_profile?.semantic_fingerprint && (
+              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: 'var(--text-muted)', wordBreak: 'break-all' }}>
+                Semantic fingerprint: {report.static_data.behavior_profile.semantic_fingerprint}
+              </div>
+            )}
           </div>
         )}
 
