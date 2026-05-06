@@ -121,10 +121,13 @@ def _string_priority(value: str, classification: str) -> int:
 def _extract_ioc_values(value: str, classification: str) -> list[str]:
     """Extract normalized IOC tokens from a classified string."""
     if classification == "URL":
-        return [
-            item.rstrip(".,;)'\"]")
-            for item in re.findall(r'https?://[^\s`"\'<>]+', value, re.IGNORECASE)
-        ]
+        urls = []
+        for item in re.findall(r'https?://[^\s`"\'<>]+', value, re.IGNORECASE):
+            item = item.rstrip(".,;)'\"]")
+            parsed = urlparse(item)
+            if parsed.hostname and len(item) <= 300:
+                urls.append(item)
+        return urls
     if classification == "IP_ADDRESS":
         lowered = value.lower()
         if any(marker in lowered for marker in ("version=", "publickeytoken", "assemblyidentity")):
@@ -285,7 +288,7 @@ BEHAVIOR_RULES = {
     "destructive_or_ransomware": {
         "patterns": [
             "vssadmin delete shadows", "wbadmin delete", "bcdedit /set",
-            "delete shadows", ".locked", ".encrypted", "recover your files",
+            "delete shadows", "recover your files",
         ],
         "mitre": ["T1486", "T1490"],
         "label": "Destructive, recovery-inhibiting, or ransomware-like behavior",
@@ -411,16 +414,17 @@ def _build_behavior_profile(strings: list[dict], iocs_dict: dict, entropy: float
 
 def _has_strong_malicious_signal(behavior_profile: dict) -> bool:
     """Require specific high-risk evidence before labeling a file malicious."""
-    strong_terms = {
-        "cryptunprotectdata", "createremotethread", "delete shadows",
-        "logonpasswords", "recover your files", "sam\\", "sekurlsa",
-        "vssadmin delete shadows", "writeprocessmemory",
-    }
+    destructive_terms = {"bcdedit /set", "delete shadows", "recover your files", "vssadmin delete shadows", "wbadmin delete"}
+    credential_terms = {"logonpasswords", "lsass", "sam\\", "sekurlsa"}
+    injection_terms = {"createremotethread", "ntmapviewofsection", "queueuserapc", "rtlcreateuserthread"}
     for capability in behavior_profile.get("capabilities") or []:
-        if capability.get("name") == "destructive_or_ransomware":
-            return True
+        name = capability.get("name")
         evidence = " ".join(str(item).lower() for item in capability.get("evidence") or [])
-        if any(term in evidence for term in strong_terms):
+        if name == "destructive_or_ransomware" and any(term in evidence for term in destructive_terms):
+            return True
+        if name == "credential_access" and any(term in evidence for term in credential_terms):
+            return True
+        if name == "process_injection" and any(term in evidence for term in injection_terms):
             return True
     return False
 
@@ -647,7 +651,7 @@ def run_analysis(job_id: str):
             match_verdict = str(best_match.get("verdict") or "").upper()
             if match_verdict == "MALICIOUS" and match_score >= 70:
                 score += 20
-            elif match_verdict in {"MALICIOUS", "SUSPICIOUS"} and match_score >= 45:
+            elif match_verdict in {"MALICIOUS", "SUSPICIOUS"} and match_score >= 60:
                 score += 10
             reasons.append(
                 f"Behaviorally similar to prior sample {best_match['file_name']} "
