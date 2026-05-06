@@ -409,6 +409,22 @@ def _build_behavior_profile(strings: list[dict], iocs_dict: dict, entropy: float
     }
 
 
+def _has_strong_malicious_signal(behavior_profile: dict) -> bool:
+    """Require specific high-risk evidence before labeling a file malicious."""
+    strong_terms = {
+        "cryptunprotectdata", "createremotethread", "delete shadows",
+        "logonpasswords", "recover your files", "sam\\", "sekurlsa",
+        "vssadmin delete shadows", "writeprocessmemory",
+    }
+    for capability in behavior_profile.get("capabilities") or []:
+        if capability.get("name") == "destructive_or_ransomware":
+            return True
+        evidence = " ".join(str(item).lower() for item in capability.get("evidence") or [])
+        if any(term in evidence for term in strong_terms):
+            return True
+    return False
+
+
 def _extract_api_tokens(strings: list[dict]) -> list[str]:
     """Pull Windows-looking API names from extracted strings."""
     counter = Counter()
@@ -578,7 +594,7 @@ def run_analysis(job_id: str):
         reasons = []
 
         if entropy > 7.0:
-            score += 30
+            score += 15
             reasons.append("High entropy suggests packed or encrypted content")
 
         url_count = len([s for s in ioc_strings if s["classification"] == "URL"])
@@ -586,13 +602,13 @@ def run_analysis(job_id: str):
         reg_count = len([s for s in ioc_strings if s["classification"] == "REGISTRY_KEY"])
 
         if url_count > 0:
-            score += min(url_count * 5, 20)
+            score += min(url_count * 3, 12)
             reasons.append(f"Contains {url_count} embedded URL(s)")
         if ip_count > 0:
             score += min(ip_count * 5, 15)
             reasons.append(f"Contains {ip_count} embedded IP address(es)")
         if reg_count > 0:
-            score += min(reg_count * 10, 20)
+            score += min(reg_count * 5, 10)
             reasons.append(f"References {reg_count} registry key(s)")
 
         behavior_names = set(behavior_profile.get("capability_names", []))
@@ -628,6 +644,9 @@ def run_analysis(job_id: str):
                 reasons.append("Unusual number of PE sections")
 
         score = min(score, 100)
+        if score >= 70 and not _has_strong_malicious_signal(behavior_profile):
+            score = 60
+            reasons.append("Score capped at suspicious because high-risk evidence is not specific enough for a malicious verdict")
 
         if score >= 70:
             verdict = Verdict.MALICIOUS
