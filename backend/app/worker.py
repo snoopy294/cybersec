@@ -409,6 +409,35 @@ def _build_behavior_profile(strings: list[dict], iocs_dict: dict, entropy: float
     }
 
 
+def _has_strong_malicious_signal(behavior_profile: dict) -> bool:
+    """Require specific high-risk evidence before labeling a file malicious."""
+    strong_terms = {
+        "cryptunprotectdata", "createremotethread", "delete shadows",
+        "logonpasswords", "recover your files", "sam\\", "sekurlsa",
+        "vssadmin delete shadows", "writeprocessmemory",
+    }
+    for capability in behavior_profile.get("capabilities") or []:
+        if capability.get("name") == "destructive_or_ransomware":
+            return True
+        evidence = " ".join(str(item).lower() for item in capability.get("evidence") or [])
+        if any(term in evidence for term in strong_terms):
+            return True
+    return False
+
+
+def _benign_software_context(file_name: str, strings: list[dict]) -> list[str]:
+    """Find soft evidence that a sample is a legitimate packaged app."""
+    haystack = "\n".join(
+        [file_name.lower()]
+        + [str(item.get("value", "")).lower() for item in strings[:1000]]
+    )
+    terms = [
+        "anthropic", "claude", "electron", "app.asar", "node.js", "chromium",
+        "squirrel", "crashpad", "microsoft corporation", "github", "visual studio code",
+    ]
+    return [term for term in terms if term in haystack]
+
+
 def _extract_api_tokens(strings: list[dict]) -> list[str]:
     """Pull Windows-looking API names from extracted strings."""
     counter = Counter()
@@ -555,6 +584,8 @@ def run_analysis(job_id: str):
             "windows_privileges": _ioc_values(ioc_strings, "WINDOWS_PRIVILEGE"),
         }
         behavior_profile = _build_behavior_profile(strings, iocs_dict, entropy, pe_info)
+        benign_context = _benign_software_context(job.file_name, strings)
+        has_strong_signal = _has_strong_malicious_signal(behavior_profile)
 
         static_data = {
             "analyzer_version": ANALYZER_VERSION,
@@ -578,7 +609,7 @@ def run_analysis(job_id: str):
         reasons = []
 
         if entropy > 7.0:
-            score += 30
+            score += 15
             reasons.append("High entropy suggests packed or encrypted content")
 
         url_count = len([s for s in ioc_strings if s["classification"] == "URL"])
@@ -586,13 +617,13 @@ def run_analysis(job_id: str):
         reg_count = len([s for s in ioc_strings if s["classification"] == "REGISTRY_KEY"])
 
         if url_count > 0:
-            score += min(url_count * 5, 20)
+            score += min(url_count * 3, 12)
             reasons.append(f"Contains {url_count} embedded URL(s)")
         if ip_count > 0:
             score += min(ip_count * 5, 15)
             reasons.append(f"Contains {ip_count} embedded IP address(es)")
         if reg_count > 0:
-            score += min(reg_count * 10, 20)
+            score += min(reg_count * 5, 10)
             reasons.append(f"References {reg_count} registry key(s)")
 
         behavior_names = set(behavior_profile.get("capability_names", []))
@@ -603,7 +634,8 @@ def run_analysis(job_id: str):
             "destructive_or_ransomware",
         }
         if high_risk_behaviors:
-            score += min(len(high_risk_behaviors) * 12, 30)
+            risk_weight = 12 if has_strong_signal else 5
+            score += min(len(high_risk_behaviors) * risk_weight, 30 if has_strong_signal else 12)
             reasons.append(
                 "Behavior profile matches high-risk capability group(s): "
                 + ", ".join(sorted(high_risk_behaviors))
@@ -612,9 +644,10 @@ def run_analysis(job_id: str):
         best_match = (cross_reference.get("top_matches") or [None])[0]
         if best_match:
             match_score = best_match["similarity_score"]
-            if match_score >= 70:
+            match_verdict = str(best_match.get("verdict") or "").upper()
+            if match_verdict == "MALICIOUS" and match_score >= 70:
                 score += 20
-            elif match_score >= 45:
+            elif match_verdict in {"MALICIOUS", "SUSPICIOUS"} and match_score >= 45:
                 score += 10
             reasons.append(
                 f"Behaviorally similar to prior sample {best_match['file_name']} "
@@ -628,6 +661,15 @@ def run_analysis(job_id: str):
                 reasons.append("Unusual number of PE sections")
 
         score = min(score, 100)
+        if benign_context and not has_strong_signal:
+            score = max(0, score - min(30, len(benign_context) * 8))
+            reasons.append(
+                "Legitimate software packaging context reduced confidence: "
+                + ", ".join(benign_context[:4])
+            )
+        if score >= 70 and not has_strong_signal:
+            score = 60
+            reasons.append("Score capped at suspicious because high-risk evidence is not specific enough for a malicious verdict")
 
         if score >= 70:
             verdict = Verdict.MALICIOUS
