@@ -30,7 +30,11 @@ from app.schemas.schemas import (
 )
 from app.services.file_service import compute_file_hashes, upload_file as store_file
 from app.services.auth_service import hash_password, verify_password, create_access_token
-from app.services.detection_service import generate_detection_pack as build_detection_pack
+from app.services.detection_service import (
+    DETECTION_STRICTNESS_LEVELS,
+    DETECTION_TARGETS,
+    generate_detection_pack as build_detection_pack,
+)
 
 settings = get_settings()
 
@@ -389,14 +393,13 @@ async def generate_detection_pack(
 
     payload = payload or DetectionPackRequest()
     targets = payload.targets
-    allowed_targets = {"yara", "sigma", "suricata", "splunk"}
     normalized_targets = [str(target).lower() for target in targets]
-    invalid = [target for target in normalized_targets if target not in allowed_targets]
+    invalid = [target for target in normalized_targets if target not in DETECTION_TARGETS]
     if invalid:
         raise HTTPException(status_code=400, detail=f"Unsupported detection target(s): {', '.join(invalid)}")
 
     strictness = payload.strictness.lower()
-    if strictness not in {"strict", "balanced", "broad"}:
+    if strictness not in DETECTION_STRICTNESS_LEVELS:
         raise HTTPException(status_code=400, detail="strictness must be strict, balanced, or broad")
 
     return build_detection_pack(report, normalized_targets, strictness)

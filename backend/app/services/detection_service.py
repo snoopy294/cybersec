@@ -6,6 +6,9 @@ import hashlib
 
 from app.models.models import ThreatReport
 
+DETECTION_TARGETS = {"yara", "sigma", "suricata", "splunk"}
+DETECTION_STRICTNESS_LEVELS = {"strict", "balanced", "broad"}
+
 
 def _sanitize_rule_token(value: str) -> str:
     return (
@@ -81,12 +84,12 @@ def generate_detection_pack(report: ThreatReport, targets: list[str], strictness
             ),
         })
 
-    if "sigma" in targets:
-        command_values = (iocs.get("commands") or selected)[:8]
+    command_values = (iocs.get("commands") or selected)[:8]
+    if "sigma" in targets and command_values:
         pack["rules"].append({
             "format": "sigma",
             "name": f"sentinel_{short_hash}_behavior_profile",
-            "confidence": 0.68 if command_values else 0.3,
+            "confidence": 0.68,
             "validation_status": "draft_unvalidated",
             "evidence": command_values,
             "content": {

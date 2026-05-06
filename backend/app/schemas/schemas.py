@@ -94,7 +94,7 @@ class ThreatReportResponse(BaseModel):
 
 class SimilarReportMatch(BaseModel):
     file_name: Optional[str] = None
-    file_hash_sha256: str
+    file_hash_sha256: Optional[str] = None
     verdict: Optional[str] = None
     severity_score: Optional[int] = None
     created_at: Optional[str] = None
