@@ -15,7 +15,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, text
 
 from app.core.database import get_db
 from app.core.config import get_settings
@@ -57,14 +57,25 @@ def _latest_report_query(file_hash: str):
 # ── Health ───────────────────────────────────────────────────────
 
 @router.get("/health", response_model=HealthResponse)
-async def health_check():
+async def health_check(db: AsyncSession = Depends(get_db)):
     """System health check endpoint."""
+    db_status = "connected"
+    try:
+        await db.execute(text("SELECT 1"))
+    except Exception:
+        db_status = "error"
+
+    redis_status = "disabled"
+    if settings.REDIS_URL:
+        redis_status = "configured"
+
+    storage_status = settings.STORAGE_BACKEND
     return HealthResponse(
-        status="ok",
+        status="ok" if db_status == "connected" else "degraded",
         version=settings.APP_VERSION,
-        db="connected",
-        redis="connected",
-        minio="connected",
+        db=db_status,
+        redis=redis_status,
+        minio=storage_status,
     )
 
 

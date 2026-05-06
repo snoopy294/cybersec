@@ -30,6 +30,10 @@ npm run dev
 
 Dashboard: **http://localhost:3000**
 
+## Deployment
+
+See [docs/deployment.md](docs/deployment.md) for the Vercel + Render setup, required environment variables, and health check configuration.
+
 ## Architecture
 
 ```

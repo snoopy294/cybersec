@@ -1,8 +1,10 @@
 """SENTINEL — Core configuration module."""
 
-from pydantic_settings import BaseSettings
 from functools import lru_cache
 import os
+
+from pydantic import field_validator, model_validator
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -12,10 +14,11 @@ class Settings(BaseSettings):
     APP_NAME: str = "SENTINEL"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = True
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
 
     # ── Database (SQLite by default — no install required) ───────
     DATABASE_URL: str = "sqlite+aiosqlite:///./sentinel.db"
-    DATABASE_URL_SYNC: str = "sqlite:///./sentinel.db"
+    DATABASE_URL_SYNC: str = ""
 
     # ── Storage (local filesystem — no MinIO required) ───────────
     STORAGE_DIR: str = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "storage")
@@ -39,6 +42,28 @@ class Settings(BaseSettings):
 
     # ── Upload Limits ────────────────────────────────────────────
     MAX_FILE_SIZE_MB: int = 500
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def normalize_async_database_url(cls, value):
+        if isinstance(value, str) and value.startswith("postgresql://"):
+            return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return value
+
+    @model_validator(mode="after")
+    def derive_sync_database_url(self):
+        if not self.DATABASE_URL_SYNC:
+            if self.DATABASE_URL.startswith("sqlite+aiosqlite://"):
+                self.DATABASE_URL_SYNC = self.DATABASE_URL.replace("sqlite+aiosqlite://", "sqlite://", 1)
+            elif self.DATABASE_URL.startswith("postgresql+asyncpg://"):
+                self.DATABASE_URL_SYNC = self.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
+            else:
+                self.DATABASE_URL_SYNC = self.DATABASE_URL
+        return self
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [item.strip() for item in self.CORS_ORIGINS.split(",") if item.strip()]
 
     class Config:
         env_file = ".env"

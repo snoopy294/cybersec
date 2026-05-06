@@ -30,6 +30,7 @@ pgdata/
 miniodata/
 
 # Local runtime analysis data
+sentinel.db
 backend/sentinel.db
 backend/storage/
 
