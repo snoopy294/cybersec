@@ -90,7 +90,50 @@ class ThreatReportResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-# ── Health ───────────────────────────────────────────────────────
+# -- Detection Schemas ---------------------------------------------------------
+
+class SimilarReportMatch(BaseModel):
+    file_name: Optional[str] = None
+    file_hash_sha256: str
+    verdict: Optional[str] = None
+    severity_score: Optional[int] = None
+    created_at: Optional[str] = None
+    similarity_score: int = 0
+    matched_behaviors: List[str] = Field(default_factory=list)
+    shared_api_tokens: List[str] = Field(default_factory=list)
+    shared_iocs: List[str] = Field(default_factory=list)
+
+
+class BehaviorSimilarityResponse(BaseModel):
+    hash: str
+    matches: List[SimilarReportMatch] = Field(default_factory=list)
+    match_count: int = 0
+    method: str = "not_available"
+
+
+class DetectionPackRequest(BaseModel):
+    targets: List[str] = Field(default_factory=lambda: ["yara", "sigma", "splunk"])
+    strictness: str = "balanced"
+
+
+class DetectionRuleResponse(BaseModel):
+    format: str
+    name: str
+    confidence: float
+    validation_status: str
+    evidence: List[str] = Field(default_factory=list)
+    content: Any
+
+
+class DetectionPackResponse(BaseModel):
+    file_hash_sha256: str
+    strictness: str
+    source_report_id: str
+    evidence_count: int
+    rules: List[DetectionRuleResponse] = Field(default_factory=list)
+
+
+# -- Health --------------------------------------------------------------------
 
 class HealthResponse(BaseModel):
     status: str = "ok"

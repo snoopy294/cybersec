@@ -26,9 +26,11 @@ from app.schemas.schemas import (
     AnalysisJobResponse, AnalysisJobDetail, JobListResponse,
     ThreatReportResponse, HealthResponse,
     UserRegister, UserLogin, TokenResponse,
+    BehaviorSimilarityResponse, DetectionPackRequest, DetectionPackResponse,
 )
 from app.services.file_service import compute_file_hashes, upload_file as store_file
 from app.services.auth_service import hash_password, verify_password, create_access_token
+from app.services.detection_service import generate_detection_pack as build_detection_pack
 
 settings = get_settings()
 
@@ -43,136 +45,6 @@ def _latest_report_query(file_hash: str):
         .order_by(desc(ThreatReport.created_at))
         .limit(1)
     )
-
-
-def _sanitize_rule_token(value: str) -> str:
-    return (
-        value.replace("\\", "\\\\")
-        .replace("\"", "\\\"")
-        .replace("\r", " ")
-        .replace("\n", " ")
-    )[:180]
-
-
-def _generate_detection_pack(report: ThreatReport, targets: list[str], strictness: str) -> dict:
-    static_data = report.static_data or {}
-    behavior_profile = static_data.get("behavior_profile") or {}
-    behavior_names = behavior_profile.get("capability_names") or []
-    iocs = report.iocs or {}
-
-    evidence_values = []
-    for key in ("urls", "registry_keys", "file_paths", "commands", "windows_privileges"):
-        evidence_values.extend(iocs.get(key) or [])
-    for capability in behavior_profile.get("capabilities") or []:
-        evidence_values.extend(capability.get("evidence") or [])
-
-    deduped_evidence = []
-    seen = set()
-    for value in evidence_values:
-        if not value or len(str(value).strip()) < 4:
-            continue
-        token = str(value).strip()
-        key = token.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped_evidence.append(token)
-
-    selected = deduped_evidence[:18 if strictness == "broad" else 12]
-    short_hash = report.file_hash_sha256[:12]
-    pack = {
-        "file_hash_sha256": report.file_hash_sha256,
-        "strictness": strictness,
-        "source_report_id": str(report.id),
-        "evidence_count": len(selected),
-        "rules": [],
-    }
-
-    if "yara" in targets:
-        strings = "\n".join(
-            f"        $s{i} = \"{_sanitize_rule_token(value)}\" nocase"
-            for i, value in enumerate(selected, start=1)
-        )
-        condition = "any of them" if selected else "uint16(0) == 0x5A4D"
-        pack["rules"].append({
-            "format": "yara",
-            "name": f"Sentinel_{short_hash}_Behavior_Profile",
-            "confidence": 0.72 if selected else 0.35,
-            "validation_status": "draft_unvalidated",
-            "evidence": selected,
-            "content": (
-                f"rule Sentinel_{short_hash}_Behavior_Profile {{\n"
-                f"    meta:\n"
-                f"        source = \"SENTINEL\"\n"
-                f"        sha256 = \"{report.file_hash_sha256}\"\n"
-                f"        behaviors = \"{', '.join(behavior_names)}\"\n"
-                f"    strings:\n"
-                f"{strings if strings else '        $mz = { 4D 5A }'}\n"
-                f"    condition:\n"
-                f"        {condition}\n"
-                f"}}"
-            ),
-        })
-
-    if "sigma" in targets:
-        command_values = (iocs.get("commands") or selected)[:8]
-        selection = [{"CommandLine|contains": value} for value in command_values]
-        pack["rules"].append({
-            "format": "sigma",
-            "name": f"sentinel_{short_hash}_behavior_profile",
-            "confidence": 0.68 if command_values else 0.3,
-            "validation_status": "draft_unvalidated",
-            "evidence": command_values,
-            "content": {
-                "title": f"SENTINEL behavior profile for {short_hash}",
-                "id": f"sentinel-{short_hash}",
-                "status": "experimental",
-                "logsource": {"category": "process_creation", "product": "windows"},
-                "detection": {
-                    "selection": selection,
-                    "condition": "selection",
-                },
-                "fields": ["Image", "CommandLine", "ParentImage", "User"],
-                "falsepositives": ["Administrative tooling with overlapping strings"],
-                "level": "high" if report.severity_score >= 70 else "medium",
-            },
-        })
-
-    if "suricata" in targets:
-        domains = []
-        for url in iocs.get("urls") or []:
-            if "://" in url:
-                host = url.split("://", 1)[1].split("/", 1)[0]
-                if host and host not in domains:
-                    domains.append(host)
-        for domain in domains[:8]:
-            pack["rules"].append({
-                "format": "suricata",
-                "name": f"sentinel_{short_hash}_{domain}",
-                "confidence": 0.62,
-                "validation_status": "draft_unvalidated",
-                "evidence": [domain],
-                "content": (
-                    f"alert http any any -> any any "
-                    f"(msg:\"SENTINEL related host {domain}\"; "
-                    f"http.host; content:\"{_sanitize_rule_token(domain)}\"; nocase; "
-                    f"sid:1{int(short_hash[:6], 16) % 900000:06d}; rev:1;)"
-                ),
-            })
-
-    if "splunk" in targets:
-        splunk_terms = selected[:10]
-        query = " OR ".join(f"\"{_sanitize_rule_token(value)}\"" for value in splunk_terms)
-        pack["rules"].append({
-            "format": "splunk",
-            "name": f"sentinel_{short_hash}_ioc_search",
-            "confidence": 0.65 if splunk_terms else 0.3,
-            "validation_status": "draft_unvalidated",
-            "evidence": splunk_terms,
-            "content": f"index=* ({query}) | stats count by host, source, sourcetype" if query else "index=* | head 0",
-        })
-
-    return pack
 
 
 # ── Health ───────────────────────────────────────────────────────
@@ -481,7 +353,7 @@ async def refresh_report(file_hash: str, db: AsyncSession = Depends(get_db)):
     )
 
 
-@router.get("/report/{file_hash}/similar")
+@router.get("/report/{file_hash}/similar", response_model=BehaviorSimilarityResponse)
 async def get_behavior_similarity(file_hash: str, db: AsyncSession = Depends(get_db)):
     """Return behavior similarity matches from the latest report."""
     result = await db.execute(_latest_report_query(file_hash))
@@ -503,10 +375,10 @@ async def get_behavior_similarity(file_hash: str, db: AsyncSession = Depends(get
     }
 
 
-@router.post("/report/{file_hash}/detections")
+@router.post("/report/{file_hash}/detections", response_model=DetectionPackResponse)
 async def generate_detection_pack(
     file_hash: str,
-    payload: Optional[dict] = Body(default=None),
+    payload: Optional[DetectionPackRequest] = Body(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     """Generate draft detection artifacts from report evidence."""
@@ -515,18 +387,16 @@ async def generate_detection_pack(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    payload = payload or {}
-    targets = payload.get("targets") or ["yara", "sigma", "splunk"]
-    if not isinstance(targets, list):
-        raise HTTPException(status_code=400, detail="targets must be a list")
+    payload = payload or DetectionPackRequest()
+    targets = payload.targets
     allowed_targets = {"yara", "sigma", "suricata", "splunk"}
     normalized_targets = [str(target).lower() for target in targets]
     invalid = [target for target in normalized_targets if target not in allowed_targets]
     if invalid:
         raise HTTPException(status_code=400, detail=f"Unsupported detection target(s): {', '.join(invalid)}")
 
-    strictness = str(payload.get("strictness") or "balanced").lower()
+    strictness = payload.strictness.lower()
     if strictness not in {"strict", "balanced", "broad"}:
         raise HTTPException(status_code=400, detail="strictness must be strict, balanced, or broad")
 
-    return _generate_detection_pack(report, normalized_targets, strictness)
+    return build_detection_pack(report, normalized_targets, strictness)
