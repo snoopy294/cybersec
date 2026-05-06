@@ -27,7 +27,7 @@ from app.core.config import get_settings
 from app.services.file_service import download_file
 
 settings = get_settings()
-ANALYZER_VERSION = "behavior-v3"
+ANALYZER_VERSION = "behavior-v4"
 
 # Synchronous DB session for the analysis worker
 sync_engine = create_engine(settings.DATABASE_URL_SYNC, connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL_SYNC else {})
@@ -672,6 +672,8 @@ def run_analysis(job_id: str):
         score = min(score, 100)
         if benign_context and not has_strong_signal:
             score = max(0, score - min(30, len(benign_context) * 8))
+            if score < 45:
+                score = min(score, 25)
             reasons.append(
                 "Legitimate software packaging context reduced confidence: "
                 + ", ".join(benign_context[:4])
