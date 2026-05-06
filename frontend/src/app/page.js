@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import axios from 'axios';
 
 const API_BASE = '/api/v1';
@@ -179,17 +179,79 @@ function VerdictBadge({ verdict }) {
 
 // ── Report View ─────────────────────────────────────────────────
 
-function ReportView({ reportHash, onBack }) {
+function ReportView({ reportHash, onBack, onRefreshQueued }) {
   const [report, setReport] = useState(null);
   const [activeTab, setActiveTab] = useState('summary');
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [stringQuery, setStringQuery] = useState('');
+  const [stringClass, setStringClass] = useState('ALL');
+  const [detectionPack, setDetectionPack] = useState(null);
+  const [detectionLoading, setDetectionLoading] = useState(false);
 
-  useEffect(() => {
+  const loadReport = useCallback(() => {
     if (!reportHash) return;
+    setLoading(true);
     axios.get(`${API_BASE}/report/${reportHash}`)
       .then(res => { setReport(res.data); setLoading(false); })
       .catch(() => setLoading(false));
   }, [reportHash]);
+
+  useEffect(() => {
+    loadReport();
+  }, [loadReport]);
+
+  const refreshReport = async () => {
+    setRefreshing(true);
+    try {
+      const res = await axios.post(`${API_BASE}/report/${reportHash}/refresh`);
+      onRefreshQueued(res.data);
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Report refresh failed');
+    }
+    setRefreshing(false);
+  };
+
+  const generateDetections = async () => {
+    setDetectionLoading(true);
+    try {
+      const res = await axios.post(`${API_BASE}/report/${reportHash}/detections`, {
+        targets: ['yara', 'sigma', 'splunk'],
+        strictness: 'balanced',
+      });
+      setDetectionPack(res.data);
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Detection generation failed');
+    }
+    setDetectionLoading(false);
+  };
+
+  const strings = useMemo(() => {
+    const source = [
+      ...(report?.static_data?.strings_sample || []),
+      ...(report?.static_data?.iocs_extracted || []),
+    ];
+    const seen = new Set();
+    return source.filter(item => {
+      const key = `${item.offset}:${item.value}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [report]);
+
+  const stringClasses = useMemo(() => (
+    ['ALL', ...Array.from(new Set(strings.map(item => item.classification || 'UNKNOWN'))).sort()]
+  ), [strings]);
+
+  const filteredStrings = useMemo(() => {
+    const query = stringQuery.toLowerCase();
+    return strings.filter(item => {
+      const classMatches = stringClass === 'ALL' || item.classification === stringClass;
+      const queryMatches = !query || String(item.value || '').toLowerCase().includes(query);
+      return classMatches && queryMatches;
+    }).slice(0, 250);
+  }, [strings, stringClass, stringQuery]);
 
   if (loading) return <div style={{ textAlign: 'center', padding: 60 }}><div className="spinner" style={{ margin: '0 auto' }} /></div>;
   if (!report) return <div className="empty-state"><div className="empty-state-title">Report not found</div></div>;
@@ -198,7 +260,12 @@ function ReportView({ reportHash, onBack }) {
 
   return (
     <div className="animate-in">
-      <button className="btn btn-ghost" onClick={onBack} style={{ marginBottom: 20 }}>← Back</button>
+      <div className="report-actions">
+        <button className="btn btn-ghost" onClick={onBack}>Back</button>
+        <button className="btn btn-primary" onClick={refreshReport} disabled={refreshing}>
+          {refreshing ? 'Refreshing...' : 'Refresh Analysis'}
+        </button>
+      </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 20, marginBottom: 24 }}>
         <div className="card" style={{ textAlign: 'center' }}>
@@ -220,9 +287,9 @@ function ReportView({ reportHash, onBack }) {
 
       <div className="card">
         <div className="tabs">
-          {['summary', 'behavior', 'static', 'iocs'].map(tab => (
+          {['summary', 'behavior', 'strings', 'static', 'iocs', 'detections'].map(tab => (
             <button key={tab} className={`tab ${activeTab === tab ? 'active' : ''}`} onClick={() => setActiveTab(tab)}>
-              {tab === 'summary' ? 'AI Summary' : tab === 'behavior' ? 'Behavior Graph' : tab === 'static' ? 'Static Analysis' : 'IOCs'}
+              {tab === 'summary' ? 'AI Summary' : tab === 'behavior' ? 'Behavior Graph' : tab === 'strings' ? 'Strings' : tab === 'static' ? 'Static Analysis' : tab === 'iocs' ? 'IOCs' : 'Detections'}
             </button>
           ))}
         </div>
@@ -298,6 +365,49 @@ function ReportView({ reportHash, onBack }) {
           </div>
         )}
 
+        {activeTab === 'strings' && (
+          <div>
+            <div className="filter-row">
+              <input
+                className="text-input"
+                value={stringQuery}
+                onChange={(e) => setStringQuery(e.target.value)}
+                placeholder="Search extracted strings"
+              />
+              <select className="select-input" value={stringClass} onChange={(e) => setStringClass(e.target.value)}>
+                {stringClasses.map(cls => <option key={cls} value={cls}>{cls}</option>)}
+              </select>
+            </div>
+            <div style={{ color: 'var(--text-muted)', fontSize: 12, marginBottom: 12 }}>
+              Showing {filteredStrings.length} of {strings.length} retained strings. Total extracted: {report.static_data?.strings_count || 0}.
+            </div>
+            {filteredStrings.length > 0 ? (
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Class</th>
+                    <th>Encoding</th>
+                    <th>Offset</th>
+                    <th>Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredStrings.map((item, i) => (
+                    <tr key={`${item.offset}-${i}`}>
+                      <td><span className="badge badge-queued">{item.classification || 'UNKNOWN'}</span></td>
+                      <td>{item.encoding || 'unknown'}</td>
+                      <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>{item.offset}</td>
+                      <td className="string-value">{item.value}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="empty-state"><div className="empty-state-title">No strings match this filter</div></div>
+            )}
+          </div>
+        )}
+
         {activeTab === 'static' && report.static_data && (
           <div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 20 }}>
@@ -351,6 +461,39 @@ function ReportView({ reportHash, onBack }) {
             ))}
             {Object.values(report.iocs).every(v => v.length === 0) && (
               <div className="empty-state"><div className="empty-state-title">No IOCs detected</div></div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'detections' && (
+          <div>
+            <div className="detection-header">
+              <div>
+                <div className="card-title">Draft Detection Pack</div>
+                <p style={{ color: 'var(--text-secondary)', fontSize: 13, marginTop: 4 }}>
+                  Generated from report evidence. Treat as draft until validated against your environment.
+                </p>
+              </div>
+              <button className="btn btn-primary" onClick={generateDetections} disabled={detectionLoading}>
+                {detectionLoading ? 'Generating...' : 'Generate Pack'}
+              </button>
+            </div>
+            {detectionPack?.rules?.length > 0 ? (
+              <div className="rule-list">
+                {detectionPack.rules.map((rule, i) => (
+                  <div className="rule-card" key={`${rule.format}-${i}`}>
+                    <div className="rule-meta">
+                      <span className="badge badge-analyzing">{rule.format}</span>
+                      <span>{Math.round((rule.confidence || 0) * 100)}% confidence</span>
+                      <span>{rule.validation_status}</span>
+                    </div>
+                    <div className="behavior-title">{rule.name}</div>
+                    <pre className="rule-content">{typeof rule.content === 'string' ? rule.content : JSON.stringify(rule.content, null, 2)}</pre>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state"><div className="empty-state-title">No detection pack generated yet</div></div>
             )}
           </div>
         )}
@@ -414,6 +557,13 @@ export default function Home() {
       setReportHash(hash);
       setPage('report');
     }
+    loadJobs();
+  };
+
+  const handleRefreshQueued = (job) => {
+    setActiveJobId(job.job_id);
+    setReportHash(null);
+    setPage('progress');
     loadJobs();
   };
 
@@ -522,7 +672,7 @@ export default function Home() {
               <h1 className="page-title">Threat Report</h1>
               <p className="page-subtitle">Detailed analysis findings</p>
             </div>
-            <ReportView reportHash={reportHash} onBack={() => setPage('dashboard')} />
+            <ReportView reportHash={reportHash} onBack={() => setPage('dashboard')} onRefreshQueued={handleRefreshQueued} />
           </div>
         )}
 

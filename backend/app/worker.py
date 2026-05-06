@@ -371,6 +371,15 @@ def _build_behavior_profile(strings: list[dict], iocs_dict: dict, entropy: float
                 "label": rule["label"],
                 "confidence": round(confidence, 2),
                 "evidence": deduped[:10],
+                "evidence_refs": [
+                    {
+                        "type": "static_string_or_indicator",
+                        "value": item,
+                        "producer": "sentinel-analysis-worker",
+                        "analyzer_version": ANALYZER_VERSION,
+                    }
+                    for item in deduped[:10]
+                ],
                 "mitre": rule["mitre"],
             })
 
@@ -551,7 +560,7 @@ def run_analysis(job_id: str):
             "analyzer_version": ANALYZER_VERSION,
             "pe_headers": pe_info,
             "strings_count": len(strings),
-            "strings_sample": strings[:100],
+            "strings_sample": strings[:500],
             "iocs_extracted": ioc_strings,
             "entropy": entropy,
             "high_entropy": entropy > 7.0,
