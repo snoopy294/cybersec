@@ -27,7 +27,7 @@ from app.core.config import get_settings
 from app.services.file_service import download_file
 
 settings = get_settings()
-ANALYZER_VERSION = "behavior-v2"
+ANALYZER_VERSION = "behavior-v3"
 
 # Synchronous DB session for the analysis worker
 sync_engine = create_engine(settings.DATABASE_URL_SYNC, connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL_SYNC else {})
@@ -414,8 +414,8 @@ def _build_behavior_profile(strings: list[dict], iocs_dict: dict, entropy: float
 
 def _has_strong_malicious_signal(behavior_profile: dict) -> bool:
     """Require specific high-risk evidence before labeling a file malicious."""
-    destructive_terms = {"bcdedit /set", "delete shadows", "recover your files", "vssadmin delete shadows", "wbadmin delete"}
-    credential_terms = {"logonpasswords", "lsass", "sam\\", "sekurlsa"}
+    destructive_terms = {"bcdedit /set", "recover your files", "vssadmin delete shadows", "wbadmin delete"}
+    credential_terms = {"logonpasswords", "lsass", "sekurlsa"}
     injection_terms = {"createremotethread", "ntmapviewofsection", "queueuserapc", "rtlcreateuserthread"}
     for capability in behavior_profile.get("capabilities") or []:
         name = capability.get("name")
@@ -616,9 +616,9 @@ def run_analysis(job_id: str):
             score += 15
             reasons.append("High entropy suggests packed or encrypted content")
 
-        url_count = len([s for s in ioc_strings if s["classification"] == "URL"])
-        ip_count = len([s for s in ioc_strings if s["classification"] == "IP_ADDRESS"])
-        reg_count = len([s for s in ioc_strings if s["classification"] == "REGISTRY_KEY"])
+        url_count = len(iocs_dict["urls"])
+        ip_count = len(iocs_dict["ips"])
+        reg_count = len(iocs_dict["registry_keys"])
 
         if url_count > 0:
             score += min(url_count * 3, 12)
