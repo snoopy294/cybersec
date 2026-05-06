@@ -125,10 +125,13 @@ def _extract_ioc_values(value: str, classification: str) -> list[str]:
         for item in re.findall(r'https?://[^\s`"\'<>]+', value, re.IGNORECASE):
             item = item.rstrip(".,;)'\"]")
             parsed = urlparse(item)
-            if parsed.hostname and len(item) <= 300:
+            host = parsed.hostname or ""
+            if parsed.hostname and len(item) <= 300 and ("." in host or host in {"localhost"}):
                 urls.append(item)
         return urls
     if classification == "IP_ADDRESS":
+        if len(value) > 300:
+            return []
         lowered = value.lower()
         if any(marker in lowered for marker in ("version=", "publickeytoken", "assemblyidentity")):
             return []
@@ -140,6 +143,8 @@ def _extract_ioc_values(value: str, classification: str) -> list[str]:
         return ips
     if classification == "EMAIL":
         return re.findall(r'\b[^@\s]+@[^@\s]+\.[^@\s]+\b', value)
+    if classification == "REGISTRY_KEY" and len(value) > 300:
+        return []
     return [value]
 
 
