@@ -133,6 +133,37 @@ class DetectionPackResponse(BaseModel):
     rules: List[DetectionRuleResponse] = Field(default_factory=list)
 
 
+# -- Feedback and Graph Schemas ------------------------------------------------
+
+class AnalystFeedbackRequest(BaseModel):
+    type: str = Field(..., min_length=1)
+    value: str = Field(..., min_length=1)
+    comment: Optional[str] = None
+
+
+class AnalystFeedbackEntry(BaseModel):
+    id: str
+    type: str
+    value: str
+    comment: Optional[str] = None
+    created_at: str
+
+
+class AnalystFeedbackResponse(BaseModel):
+    file_hash_sha256: str
+    feedback: AnalystFeedbackEntry
+    feedback_count: int
+
+
+class GraphRelationshipResponse(BaseModel):
+    entity_type: str
+    entity_id: str
+    depth: int
+    method: str
+    nodes: List[dict] = Field(default_factory=list)
+    edges: List[dict] = Field(default_factory=list)
+
+
 # -- Health --------------------------------------------------------------------
 
 class HealthResponse(BaseModel):

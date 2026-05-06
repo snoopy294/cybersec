@@ -9,7 +9,8 @@ Implements the core REST API contracts defined in the architecture specification
   - POST /api/v1/auth/login    — Login and get JWT
 """
 
-from uuid import UUID
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
 from typing import Optional
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Body
@@ -27,6 +28,7 @@ from app.schemas.schemas import (
     ThreatReportResponse, HealthResponse,
     UserRegister, UserLogin, TokenResponse,
     BehaviorSimilarityResponse, DetectionPackRequest, DetectionPackResponse,
+    AnalystFeedbackRequest, AnalystFeedbackResponse, GraphRelationshipResponse,
 )
 from app.services.file_service import compute_file_hashes, upload_file as store_file
 from app.services.auth_service import hash_password, verify_password, create_access_token
@@ -35,6 +37,7 @@ from app.services.detection_service import (
     DETECTION_TARGETS,
     generate_detection_pack as build_detection_pack,
 )
+from app.services.graph_service import build_relationship_graph
 
 settings = get_settings()
 
@@ -403,3 +406,76 @@ async def generate_detection_pack(
         raise HTTPException(status_code=400, detail="strictness must be strict, balanced, or broad")
 
     return build_detection_pack(report, normalized_targets, strictness)
+
+
+@router.post("/report/{file_hash}/feedback", response_model=AnalystFeedbackResponse)
+async def submit_analyst_feedback(
+    file_hash: str,
+    payload: AnalystFeedbackRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Attach analyst feedback to a living report."""
+    result = await db.execute(_latest_report_query(file_hash))
+    report = result.scalar_one_or_none()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    feedback = {
+        "id": str(uuid4()),
+        "type": payload.type,
+        "value": payload.value,
+        "comment": payload.comment,
+        "created_at": created_at,
+    }
+
+    static_data = dict(report.static_data or {})
+    feedback_items = list(static_data.get("analyst_feedback") or [])
+    feedback_items.append(feedback)
+    static_data["analyst_feedback"] = feedback_items
+
+    event_log = list(static_data.get("event_log") or [])
+    event_log.append({
+        "type": "feedback.submitted",
+        "created_at": created_at,
+        "feedback_id": feedback["id"],
+    })
+    static_data["event_log"] = event_log[-100:]
+
+    report.static_data = static_data
+    await db.commit()
+
+    return {
+        "file_hash_sha256": report.file_hash_sha256,
+        "feedback": feedback,
+        "feedback_count": len(feedback_items),
+    }
+
+
+@router.get("/graph/relationships", response_model=GraphRelationshipResponse)
+async def get_graph_relationships(
+    entity_type: str = Query(...),
+    entity_id: str = Query(...),
+    depth: int = Query(1, ge=1, le=2),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return report-derived graph relationships for files, behaviors, and IOCs."""
+    normalized_type = entity_type.lower()
+    if normalized_type not in {"file", "behavior", "ioc"}:
+        raise HTTPException(status_code=400, detail="entity_type must be file, behavior, or ioc")
+
+    if normalized_type == "file":
+        result = await db.execute(_latest_report_query(entity_id))
+        report = result.scalar_one_or_none()
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+        reports = [report]
+    else:
+        result = await db.execute(
+            select(ThreatReport)
+            .order_by(desc(ThreatReport.created_at))
+            .limit(250)
+        )
+        reports = result.scalars().all()
+
+    return build_relationship_graph(normalized_type, entity_id, depth, reports)
