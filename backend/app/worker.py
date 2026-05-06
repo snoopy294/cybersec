@@ -27,7 +27,7 @@ from app.core.config import get_settings
 from app.services.file_service import download_file
 
 settings = get_settings()
-ANALYZER_VERSION = "behavior-v4"
+ANALYZER_VERSION = "behavior-v5"
 
 # Synchronous DB session for the analysis worker
 sync_engine = create_engine(settings.DATABASE_URL_SYNC, connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL_SYNC else {})
@@ -447,6 +447,81 @@ def _benign_software_context(file_name: str, strings: list[dict]) -> list[str]:
     return [term for term in terms if term in haystack]
 
 
+DEPENDENCY_REPOSITORY_HOSTS = {
+    "pypi.org",
+    "files.pythonhosted.org",
+    "pythonhosted.org",
+    "registry.npmjs.org",
+    "npmjs.org",
+    "registry.yarnpkg.com",
+    "yarnpkg.com",
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "search.maven.org",
+    "plugins.gradle.org",
+    "api.nuget.org",
+    "nuget.org",
+    "globalcdn.nuget.org",
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    "proxy.golang.org",
+    "sum.golang.org",
+    "rubygems.org",
+    "packagist.org",
+    "repo.packagist.org",
+    "conda.anaconda.org",
+    "repo.anaconda.com",
+}
+
+
+def _dependency_install_context(file_name: str, strings: list[dict], urls: list[str]) -> list[str]:
+    """Find evidence that network/file access is package installation or dependency resolution."""
+    haystack = "\n".join(
+        [file_name.lower()]
+        + [str(item.get("value", "")).lower() for item in strings[:1500]]
+        + [url.lower() for url in urls]
+    )
+    terms = [
+        "package.json", "package-lock.json", "npm-shrinkwrap", "node_modules",
+        "npm install", "npm ci", "yarn.lock", "yarn install", "pnpm-lock.yaml",
+        "pnpm install", "registry.npmjs.org",
+        "requirements.txt", "pip install", "pyproject.toml", "setup.py",
+        "poetry.lock", "pipfile.lock", "site-packages", ".dist-info", ".whl",
+        "pypi.org", "files.pythonhosted.org",
+        "pom.xml", "build.gradle", "gradle-wrapper", "repo.maven.apache.org",
+        "nuget.config", "packages.config", ".nupkg", "api.nuget.org",
+        "cargo.toml", "cargo.lock", "crates.io",
+        "go.mod", "go.sum", "proxy.golang.org",
+        "composer.json", "composer.lock", "packagist.org",
+        "environment.yml", "conda install", "conda-forge",
+    ]
+    return [term for term in terms if term in haystack]
+
+
+def _dependency_repository_urls(urls: list[str]) -> list[str]:
+    """Return URLs that point at common package repositories rather than app-controlled endpoints."""
+    dependency_urls = []
+    for url in urls:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host in DEPENDENCY_REPOSITORY_HOSTS:
+            dependency_urls.append(url)
+            continue
+        if host.endswith(".pkg.github.com") or host.endswith(".jfrog.io"):
+            dependency_urls.append(url)
+            continue
+        if any(marker in path for marker in (
+            "/simple/", "/packages/", "/npm/", "/maven2/", "/nuget/",
+            "/crates/", "/composer/", "/pypi/", "/artifactory/",
+        )):
+            dependency_urls.append(url)
+    return dependency_urls
+
+
 def _extract_api_tokens(strings: list[dict]) -> list[str]:
     """Pull Windows-looking API names from extracted strings."""
     counter = Counter()
@@ -594,6 +669,8 @@ def run_analysis(job_id: str):
         }
         behavior_profile = _build_behavior_profile(strings, iocs_dict, entropy, pe_info)
         benign_context = _benign_software_context(job.file_name, strings)
+        dependency_context = _dependency_install_context(job.file_name, strings, iocs_dict["urls"])
+        dependency_urls = _dependency_repository_urls(iocs_dict["urls"])
         has_strong_signal = _has_strong_malicious_signal(behavior_profile)
 
         static_data = {
@@ -605,6 +682,9 @@ def run_analysis(job_id: str):
             "entropy": entropy,
             "high_entropy": entropy > 7.0,
             "behavior_profile": behavior_profile,
+            "benign_context": benign_context,
+            "dependency_install_context": dependency_context,
+            "dependency_repository_urls": dependency_urls[:50],
         }
         cross_reference = _find_behavior_matches(session, job, static_data, iocs_dict)
         static_data["cross_reference"] = cross_reference
@@ -624,15 +704,25 @@ def run_analysis(job_id: str):
         url_count = len(iocs_dict["urls"])
         ip_count = len(iocs_dict["ips"])
         reg_count = len(iocs_dict["registry_keys"])
+        scored_url_count = url_count
+        if dependency_context and dependency_urls and not has_strong_signal:
+            scored_url_count = max(0, url_count - len(dependency_urls))
+            reasons.append(
+                f"Recognized {len(dependency_urls)} package repository URL(s) as dependency-install context"
+            )
 
-        if url_count > 0:
-            score += min(url_count * 3, 12)
-            reasons.append(f"Contains {url_count} embedded URL(s)")
+        if scored_url_count > 0:
+            url_weight = 2 if dependency_context and not has_strong_signal else 3
+            url_cap = 6 if dependency_context and not has_strong_signal else 12
+            score += min(scored_url_count * url_weight, url_cap)
+            reasons.append(f"Contains {scored_url_count} non-package embedded URL(s)")
         if ip_count > 0:
             score += min(ip_count * 5, 15)
             reasons.append(f"Contains {ip_count} embedded IP address(es)")
         if reg_count > 0:
-            score += min(reg_count * 5, 10)
+            reg_weight = 2 if dependency_context and not has_strong_signal else 5
+            reg_cap = 4 if dependency_context and not has_strong_signal else 10
+            score += min(reg_count * reg_weight, reg_cap)
             reasons.append(f"References {reg_count} registry key(s)")
 
         behavior_names = set(behavior_profile.get("capability_names", []))
@@ -670,13 +760,17 @@ def run_analysis(job_id: str):
                 reasons.append("Unusual number of PE sections")
 
         score = min(score, 100)
-        if benign_context and not has_strong_signal:
-            score = max(0, score - min(30, len(benign_context) * 8))
+        benign_reducers = benign_context + dependency_context
+        if benign_reducers and not has_strong_signal:
+            reduction_cap = 40 if dependency_context else 30
+            score = max(0, score - min(reduction_cap, len(benign_reducers) * 8))
+            if dependency_context and not high_risk_behaviors:
+                score = min(score, 20)
             if score < 45:
                 score = min(score, 25)
             reasons.append(
-                "Legitimate software packaging context reduced confidence: "
-                + ", ".join(benign_context[:4])
+                "Legitimate software packaging or dependency-install context reduced confidence: "
+                + ", ".join(benign_reducers[:6])
             )
         if score >= 70 and not has_strong_signal:
             score = 60
