@@ -6,6 +6,8 @@ This repo is set up for a split deployment:
 - Backend API: Render Docker web service, using `backend/` as the service root
 - Database: Render Postgres
 
+For the remaining hosted MVP rollout, see [MVP Deployment Plan](mvp_deployment_plan.md).
+
 ## Backend on Render
 
 1. Create a Render Blueprint from `render.yaml`, or create a Docker web service manually.
@@ -60,4 +62,3 @@ Health check:
 ```bash
 curl http://localhost:8000/api/v1/health
 ```
-
