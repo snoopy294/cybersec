@@ -25,6 +25,8 @@ MVP means hosted and demonstrable. It does not mean fully production-hardened.
 
 Keep background-thread analysis for the MVP unless analysis jobs become too slow or unreliable. If that happens, promote analysis to a separate worker service with Redis/Celery.
 
+The Render blueprint is configured for R2-backed storage. Do not switch the hosted MVP back to local storage unless you are intentionally running a temporary demo and accept losing uploaded samples on redeploy.
+
 ## Environment Variables
 
 ### Vercel
@@ -86,6 +88,23 @@ curl https://<render-api-host>/api/v1/health
 11. Redeploy Render after the final CORS value is set.
 12. Run the end-to-end smoke test through the Vercel URL.
 
+## Cloudflare R2 Setup Details
+
+1. In Cloudflare, create an R2 bucket for SENTINEL uploads.
+2. Keep the bucket private.
+3. Create an R2 API token or access key pair with permission to read and write objects in that bucket.
+4. Copy the account-specific S3 API endpoint, usually shaped like:
+
+```text
+<account-id>.r2.cloudflarestorage.com
+```
+
+5. Set Render `MINIO_ENDPOINT` to that host-only value. Do not include `https://`.
+6. Set `MINIO_SECURE=true`.
+7. After deploy, `GET /api/v1/health` should return a storage value like `minio:connected`.
+
+If health returns `minio:bucket_missing`, the bucket name is wrong or inaccessible to the key. If it returns `minio:error:*`, verify endpoint format, key permissions, and whether `MINIO_SECURE` is set to `true`.
+
 ## MVP Acceptance Criteria
 
 - `/` loads the public SENTINEL landing page.
@@ -116,6 +135,18 @@ Health checks:
 - Local: `GET http://localhost:8000/api/v1/health`
 - Render: `GET https://<render-api-host>/api/v1/health`
 - Vercel rewrite: `GET https://<vercel-host>/api/v1/health`
+
+Expected hosted health response:
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "db": "connected",
+  "redis": "disabled",
+  "minio": "minio:connected"
+}
+```
 
 Upload smoke test:
 

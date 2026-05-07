@@ -19,15 +19,19 @@ For the remaining hosted MVP rollout, see [MVP Deployment Plan](mvp_deployment_p
 DEBUG=false
 CORS_ORIGINS=https://your-vercel-app.vercel.app
 DATABASE_URL=<Render Postgres connection string>
-STORAGE_BACKEND=local
-STORAGE_DIR=/app/storage
+STORAGE_BACKEND=minio
+MINIO_ENDPOINT=<account-id>.r2.cloudflarestorage.com
+MINIO_ACCESS_KEY=<r2-access-key-id>
+MINIO_SECRET_KEY=<r2-secret-access-key>
+MINIO_BUCKET=<r2-bucket-name>
+MINIO_SECURE=true
 SECRET_KEY=<generated secret>
 USE_CELERY=false
 ```
 
 Render commonly provides `DATABASE_URL` as `postgresql://...`; the backend normalizes it to the async URL used by SQLAlchemy and derives the sync URL used by the analysis worker.
 
-Local storage on Render is ephemeral. It is acceptable for an early demo, but uploaded samples can disappear after redeploys. Move `STORAGE_BACKEND` to MinIO/S3-compatible storage before relying on retained samples.
+Cloudflare R2 is the MVP object-storage target. Keep the R2 bucket private and set `MINIO_ENDPOINT` to the host-only account endpoint without `https://`.
 
 ## Frontend on Vercel
 

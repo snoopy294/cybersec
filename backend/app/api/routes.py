@@ -30,7 +30,13 @@ from app.schemas.schemas import (
     BehaviorSimilarityResponse, DetectionPackRequest, DetectionPackResponse,
     AnalystFeedbackRequest, AnalystFeedbackResponse, GraphRelationshipResponse,
 )
-from app.services.file_service import compute_file_hashes, upload_file as store_file
+from app.services.file_service import (
+    StorageConfigurationError,
+    StorageOperationError,
+    compute_file_hashes,
+    storage_health_status,
+    upload_file as store_file,
+)
 from app.services.auth_service import hash_password, verify_password, create_access_token
 from app.services.detection_service import (
     DETECTION_STRICTNESS_LEVELS,
@@ -69,9 +75,10 @@ async def health_check(db: AsyncSession = Depends(get_db)):
     if settings.REDIS_URL:
         redis_status = "configured"
 
-    storage_status = settings.STORAGE_BACKEND
+    storage_status = storage_health_status()
+    is_storage_ready = storage_status.endswith(":ready") or storage_status.endswith(":connected")
     return HealthResponse(
-        status="ok" if db_status == "connected" else "degraded",
+        status="ok" if db_status == "connected" and is_storage_ready else "degraded",
         version=settings.APP_VERSION,
         db=db_status,
         redis=redis_status,
@@ -192,13 +199,16 @@ async def upload_file(
         await db.flush()
 
     # Store file (local filesystem or MinIO depending on config)
-    object_path = store_file(
-        tenant_id=str(tenant.id),
-        sha256_hash=hashes["sha256"],
-        file_name=file.filename or "unknown",
-        file_bytes=file_bytes,
-        content_type=file.content_type or "application/octet-stream",
-    )
+    try:
+        object_path = store_file(
+            tenant_id=str(tenant.id),
+            sha256_hash=hashes["sha256"],
+            file_name=file.filename or "unknown",
+            file_bytes=file_bytes,
+            content_type=file.content_type or "application/octet-stream",
+        )
+    except (StorageConfigurationError, StorageOperationError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     # Create job record
     job = AnalysisJob(
