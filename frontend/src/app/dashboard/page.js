@@ -23,16 +23,23 @@ function AuthPanel({ onAuthenticated }) {
         ? { email, password, tenant_name: tenantName }
         : { email, password };
       const res = await axios.post(`${API_BASE}/auth/${mode === 'signup' ? 'register' : 'login'}`, payload);
+      const profile = await axios.get(`${API_BASE}/auth/me`, {
+        headers: { Authorization: `Bearer ${res.data.access_token}` },
+      });
       onAuthenticated({
         token: res.data.access_token,
-        userId: res.data.user_id,
-        tenantId: res.data.tenant_id,
-        email,
+        userId: profile.data.user_id,
+        tenantId: profile.data.tenant_id,
+        email: profile.data.email,
+        role: profile.data.role,
+        tenantName: profile.data.tenant_name,
+        tenantTier: profile.data.tenant_tier,
       });
     } catch (err) {
       setError(err.response?.data?.detail || 'Authentication failed');
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   return (
@@ -101,7 +108,7 @@ function Sidebar({ currentPage, onNavigate, session, onLogout }) {
       </nav>
       <div className="sidebar-account">
         <div className="account-email">{session?.email}</div>
-        <div className="account-meta">Protected workspace</div>
+        <div className="account-meta">{session?.tenantName || 'Protected workspace'}</div>
         <button className="btn btn-ghost btn-full" type="button" onClick={onLogout}>Sign Out</button>
       </div>
       <div style={{ padding: '16px 24px', borderTop: '1px solid var(--border-color)', fontSize: 11, color: 'var(--text-muted)' }}>
@@ -295,8 +302,9 @@ function ReportView({ reportHash, onBack, onRefreshQueued, apiClient, onAuthExpi
         return;
       }
       alert(err.response?.data?.detail || 'Report refresh failed');
+    } finally {
+      setRefreshing(false);
     }
-    setRefreshing(false);
   };
 
   const generateDetections = async () => {
@@ -313,8 +321,9 @@ function ReportView({ reportHash, onBack, onRefreshQueued, apiClient, onAuthExpi
         return;
       }
       alert(err.response?.data?.detail || 'Detection generation failed');
+    } finally {
+      setDetectionLoading(false);
     }
-    setDetectionLoading(false);
   };
 
   const strings = useMemo(() => {
@@ -605,16 +614,6 @@ export default function Home() {
   const [session, setSession] = useState(null);
   const [authReady, setAuthReady] = useState(false);
 
-  useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem(SESSION_KEY);
-      if (saved) setSession(JSON.parse(saved));
-    } catch {
-      window.localStorage.removeItem(SESSION_KEY);
-    }
-    setAuthReady(true);
-  }, []);
-
   const apiClient = useMemo(() => axios.create({
     headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
   }), [session?.token]);
@@ -638,6 +637,47 @@ export default function Home() {
   const handleLogout = useCallback(() => {
     handleAuthExpired();
   }, [handleAuthExpired]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const validateSavedSession = async () => {
+      try {
+        const saved = window.localStorage.getItem(SESSION_KEY);
+        if (!saved) return;
+
+        const parsed = JSON.parse(saved);
+        if (!parsed?.token) {
+          window.localStorage.removeItem(SESSION_KEY);
+          return;
+        }
+
+        const res = await axios.get(`${API_BASE}/auth/me`, {
+          headers: { Authorization: `Bearer ${parsed.token}` },
+        });
+        if (cancelled) return;
+
+        const restoredSession = {
+          token: parsed.token,
+          userId: res.data.user_id,
+          tenantId: res.data.tenant_id,
+          email: res.data.email,
+          role: res.data.role,
+          tenantName: res.data.tenant_name,
+          tenantTier: res.data.tenant_tier,
+        };
+        window.localStorage.setItem(SESSION_KEY, JSON.stringify(restoredSession));
+        setSession(restoredSession);
+      } catch {
+        window.localStorage.removeItem(SESSION_KEY);
+      } finally {
+        if (!cancelled) setAuthReady(true);
+      }
+    };
+
+    validateSavedSession();
+    return () => { cancelled = true; };
+  }, []);
 
   // Load jobs
   const loadJobs = useCallback(async () => {
@@ -681,8 +721,9 @@ export default function Home() {
         return;
       }
       alert(err.response?.data?.detail || 'Upload failed');
+    } finally {
+      setUploading(false);
     }
-    setUploading(false);
   };
 
   // Handle job completion

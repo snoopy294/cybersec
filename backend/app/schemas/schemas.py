@@ -30,6 +30,15 @@ class TokenResponse(BaseModel):
     tenant_id: UUID
 
 
+class UserProfileResponse(BaseModel):
+    user_id: UUID
+    tenant_id: UUID
+    email: str
+    role: UserRole
+    tenant_name: str
+    tenant_tier: TenantTier
+
+
 # ── Job Schemas ──────────────────────────────────────────────────
 
 class AnalysisJobCreate(BaseModel):

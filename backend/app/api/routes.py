@@ -27,7 +27,7 @@ from app.models.models import (
 from app.schemas.schemas import (
     AnalysisJobResponse, AnalysisJobDetail, JobListResponse,
     ThreatReportResponse, HealthResponse,
-    UserRegister, UserLogin, TokenResponse,
+    UserRegister, UserLogin, TokenResponse, UserProfileResponse,
     BehaviorSimilarityResponse, DetectionPackRequest, DetectionPackResponse,
     AnalystFeedbackRequest, AnalystFeedbackResponse, GraphRelationshipResponse,
 )
@@ -171,6 +171,29 @@ async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
         access_token=token,
         user_id=user.id,
         tenant_id=user.tenant_id,
+    )
+
+
+# ── Authenticated Profile ────────────────────────────────────────
+
+@auth_router.get("/me", response_model=UserProfileResponse)
+async def get_authenticated_profile(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the authenticated user's current workspace profile."""
+    result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=401, detail="Tenant not found")
+
+    return UserProfileResponse(
+        user_id=current_user.id,
+        tenant_id=current_user.tenant_id,
+        email=current_user.email,
+        role=current_user.role,
+        tenant_name=tenant.name,
+        tenant_tier=tenant.tier,
     )
 
 
