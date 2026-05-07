@@ -427,6 +427,14 @@ code, pre {
   position: relative;
 }
 
+.upload-limit-note {
+  margin-top: 14px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+}
+
 /* ── Table ────────────────────────────────────────────────────── */
 
 .data-table {

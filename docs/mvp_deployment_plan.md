@@ -159,7 +159,8 @@ Upload smoke test:
 
 ## Known MVP Limitations
 
-- There is no real auth or user isolation yet.
+- Basic dashboard auth and tenant-scoped jobs/reports are in place.
+- There is no rate limiting or invite-only signup gate yet.
 - Background-thread analysis is acceptable for the MVP but not ideal for long-running production jobs.
 - Malware sample handling still needs a retention policy, stricter access controls, and operational safety rules before public launch.
 - The Cloudflare R2 bucket should remain private; do not enable public object access for uploaded samples.
@@ -169,7 +170,7 @@ Upload smoke test:
 
 After the MVP deployment is live, prioritize:
 
-1. Authentication and user-scoped jobs/reports.
+1. Rate limiting and abuse controls for public signup/upload.
 2. Real app routes for `/analyze`, `/reports`, `/reports/[hash]`, and `/settings`.
 3. Upload retention controls and sample deletion.
 4. Optional Redis/Celery worker split if analysis runtime exceeds Render web-service expectations.

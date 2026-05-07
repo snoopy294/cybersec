@@ -5,6 +5,8 @@ import axios from 'axios';
 
 const API_BASE = '/api/v1';
 const SESSION_KEY = 'sentinel_session';
+const MAX_UPLOAD_SIZE_MB = 500;
+const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024;
 
 function AuthPanel({ onAuthenticated }) {
   const [mode, setMode] = useState('login');
@@ -708,6 +710,11 @@ export default function Home() {
 
   // Handle file upload
   const handleFileUpload = async (file) => {
+    if (file.size > MAX_UPLOAD_SIZE_BYTES) {
+      alert(`File exceeds the ${MAX_UPLOAD_SIZE_MB} MB MVP upload limit.`);
+      return;
+    }
+
     setUploading(true);
     try {
       const formData = new FormData();
@@ -838,7 +845,12 @@ export default function Home() {
                 <p style={{ color: 'var(--text-secondary)' }}>Uploading and hashing...</p>
               </div>
             ) : (
-              <UploadZone onFileSelected={handleFileUpload} />
+              <>
+                <UploadZone onFileSelected={handleFileUpload} />
+                <p className="upload-limit-note">
+                  MVP upload limit: {MAX_UPLOAD_SIZE_MB} MB. Use a small harmless test file for deployment smoke tests.
+                </p>
+              </>
             )}
           </div>
         )}

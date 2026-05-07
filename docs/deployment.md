@@ -6,7 +6,7 @@ This repo is set up for a split deployment:
 - Backend API: Render Docker web service, using `backend/` as the service root
 - Database: Render Postgres
 
-For the remaining hosted MVP rollout, see [MVP Deployment Plan](mvp_deployment_plan.md).
+For the remaining hosted MVP rollout, see [MVP Deployment Plan](mvp_deployment_plan.md). For the exact deploy procedure and smoke test, use the [Deployment Runbook](deployment_runbook.md).
 
 ## Backend on Render
 
