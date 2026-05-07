@@ -140,6 +140,27 @@ code, pre {
   gap: 4px;
 }
 
+.sidebar-account {
+  padding: 16px 24px;
+  border-top: 1px solid var(--border-color);
+  display: grid;
+  gap: 10px;
+}
+
+.account-email {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 .nav-item {
   display: flex;
   align-items: center;
@@ -170,6 +191,71 @@ code, pre {
   flex: 1;
   padding: 32px;
   min-height: 100vh;
+}
+
+.auth-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(0, 210, 255, 0.16), transparent 34%),
+    var(--bg-primary);
+}
+
+.auth-panel {
+  width: min(100%, 440px);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: 32px;
+  box-shadow: var(--shadow-lg);
+}
+
+.auth-panel h1 {
+  font-size: 28px;
+  line-height: 1.15;
+  margin: 16px 0 10px;
+}
+
+.auth-copy {
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.6;
+  margin-bottom: 24px;
+}
+
+.auth-form {
+  display: grid;
+  gap: 14px;
+}
+
+.auth-form label {
+  display: grid;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.auth-error {
+  border: 1px solid rgba(255, 82, 82, 0.25);
+  background: rgba(255, 82, 82, 0.1);
+  color: var(--color-danger);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  font-size: 13px;
+}
+
+.auth-switch {
+  width: 100%;
+  margin-top: 16px;
+  border: none;
+  background: transparent;
+  color: var(--accent-secondary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
 }
 
 /* ── Header ───────────────────────────────────────────────────── */
@@ -717,6 +803,11 @@ code, pre {
   .filter-row { grid-template-columns: 1fr; }
   .behavior-row { grid-template-columns: 1fr; }
   .behavior-evidence { justify-content: flex-start; }
+}
+
+.btn-full {
+  width: 100%;
+  justify-content: center;
 }
 
 /* Marketing site */

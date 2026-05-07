@@ -4,10 +4,77 @@ import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import axios from 'axios';
 
 const API_BASE = '/api/v1';
+const SESSION_KEY = 'sentinel_session';
+
+function AuthPanel({ onAuthenticated }) {
+  const [mode, setMode] = useState('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [tenantName, setTenantName] = useState('Default Workspace');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (event) => {
+    event.preventDefault();
+    setLoading(true);
+    setError('');
+    try {
+      const payload = mode === 'signup'
+        ? { email, password, tenant_name: tenantName }
+        : { email, password };
+      const res = await axios.post(`${API_BASE}/auth/${mode === 'signup' ? 'register' : 'login'}`, payload);
+      onAuthenticated({
+        token: res.data.access_token,
+        userId: res.data.user_id,
+        tenantId: res.data.tenant_id,
+        email,
+      });
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Authentication failed');
+    }
+    setLoading(false);
+  };
+
+  return (
+    <main className="auth-page">
+      <section className="auth-panel">
+        <div className="sidebar-logo">S</div>
+        <p className="marketing-kicker">SENTINEL workspace</p>
+        <h1>{mode === 'signup' ? 'Create your analyst workspace' : 'Sign in to continue'}</h1>
+        <p className="auth-copy">
+          Dashboard access is protected so uploads, jobs, and reports stay scoped to your organization.
+        </p>
+        <form className="auth-form" onSubmit={submit}>
+          {mode === 'signup' && (
+            <label>
+              Workspace name
+              <input className="text-input" value={tenantName} onChange={(e) => setTenantName(e.target.value)} required />
+            </label>
+          )}
+          <label>
+            Email
+            <input className="text-input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
+          </label>
+          <label>
+            Password
+            <input className="text-input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} minLength={8} required />
+          </label>
+          {error && <div className="auth-error">{error}</div>}
+          <button className="btn btn-primary" type="submit" disabled={loading}>
+            {loading ? 'Working...' : mode === 'signup' ? 'Create Account' : 'Sign In'}
+          </button>
+        </form>
+        <button className="auth-switch" type="button" onClick={() => { setMode(mode === 'signup' ? 'login' : 'signup'); setError(''); }}>
+          {mode === 'signup' ? 'Already have an account? Sign in' : 'Need an account? Create one'}
+        </button>
+      </section>
+    </main>
+  );
+}
 
 // ── Sidebar ─────────────────────────────────────────────────────
 
-function Sidebar({ currentPage, onNavigate }) {
+function Sidebar({ currentPage, onNavigate, session, onLogout }) {
   const navItems = [
     { id: 'dashboard', label: 'Command Center', icon: '◉' },
     { id: 'upload', label: 'Analyze File', icon: '⬆' },
@@ -32,6 +99,11 @@ function Sidebar({ currentPage, onNavigate }) {
           </div>
         ))}
       </nav>
+      <div className="sidebar-account">
+        <div className="account-email">{session?.email}</div>
+        <div className="account-meta">Protected workspace</div>
+        <button className="btn btn-ghost btn-full" type="button" onClick={onLogout}>Sign Out</button>
+      </div>
       <div style={{ padding: '16px 24px', borderTop: '1px solid var(--border-color)', fontSize: 11, color: 'var(--text-muted)' }}>
         SENTINEL v0.1.0 — Pre-Seed
       </div>
@@ -93,25 +165,30 @@ function UploadZone({ onFileSelected }) {
 
 // ── Analysis Progress ───────────────────────────────────────────
 
-function AnalysisProgress({ jobId, onComplete }) {
+function AnalysisProgress({ jobId, onComplete, apiClient, onAuthExpired }) {
   const [job, setJob] = useState(null);
 
   useEffect(() => {
     if (!jobId) return;
     const interval = setInterval(async () => {
       try {
-        const res = await axios.get(`${API_BASE}/analyze/${jobId}`);
+        const res = await apiClient.get(`${API_BASE}/analyze/${jobId}`);
         setJob(res.data);
         if (res.data.status === 'COMPLETED' || res.data.status === 'FAILED') {
           clearInterval(interval);
           if (res.data.status === 'COMPLETED') onComplete(res.data);
         }
       } catch (err) {
+        if (err.response?.status === 401) {
+          clearInterval(interval);
+          onAuthExpired();
+          return;
+        }
         console.error('Poll error:', err);
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, [jobId, onComplete]);
+  }, [jobId, onComplete, apiClient, onAuthExpired]);
 
   const statusLabel = {
     QUEUED: 'Queued for analysis...',
@@ -179,7 +256,7 @@ function VerdictBadge({ verdict }) {
 
 // ── Report View ─────────────────────────────────────────────────
 
-function ReportView({ reportHash, onBack, onRefreshQueued }) {
+function ReportView({ reportHash, onBack, onRefreshQueued, apiClient, onAuthExpired }) {
   const [report, setReport] = useState(null);
   const [activeTab, setActiveTab] = useState('summary');
   const [loading, setLoading] = useState(true);
@@ -192,10 +269,16 @@ function ReportView({ reportHash, onBack, onRefreshQueued }) {
   const loadReport = useCallback(() => {
     if (!reportHash) return;
     setLoading(true);
-    axios.get(`${API_BASE}/report/${reportHash}`)
+    apiClient.get(`${API_BASE}/report/${reportHash}`)
       .then(res => { setReport(res.data); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, [reportHash]);
+      .catch((err) => {
+        if (err.response?.status === 401) {
+          onAuthExpired();
+          return;
+        }
+        setLoading(false);
+      });
+  }, [reportHash, apiClient, onAuthExpired]);
 
   useEffect(() => {
     loadReport();
@@ -204,9 +287,13 @@ function ReportView({ reportHash, onBack, onRefreshQueued }) {
   const refreshReport = async () => {
     setRefreshing(true);
     try {
-      const res = await axios.post(`${API_BASE}/report/${reportHash}/refresh`);
+      const res = await apiClient.post(`${API_BASE}/report/${reportHash}/refresh`);
       onRefreshQueued(res.data);
     } catch (err) {
+      if (err.response?.status === 401) {
+        onAuthExpired();
+        return;
+      }
       alert(err.response?.data?.detail || 'Report refresh failed');
     }
     setRefreshing(false);
@@ -215,12 +302,16 @@ function ReportView({ reportHash, onBack, onRefreshQueued }) {
   const generateDetections = async () => {
     setDetectionLoading(true);
     try {
-      const res = await axios.post(`${API_BASE}/report/${reportHash}/detections`, {
+      const res = await apiClient.post(`${API_BASE}/report/${reportHash}/detections`, {
         targets: ['yara', 'sigma', 'splunk'],
         strictness: 'balanced',
       });
       setDetectionPack(res.data);
     } catch (err) {
+      if (err.response?.status === 401) {
+        onAuthExpired();
+        return;
+      }
       alert(err.response?.data?.detail || 'Detection generation failed');
     }
     setDetectionLoading(false);
@@ -511,11 +602,48 @@ export default function Home() {
   const [reportHash, setReportHash] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [stats, setStats] = useState({ total: 0, completed: 0, malicious: 0, queued: 0 });
+  const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(SESSION_KEY);
+      if (saved) setSession(JSON.parse(saved));
+    } catch {
+      window.localStorage.removeItem(SESSION_KEY);
+    }
+    setAuthReady(true);
+  }, []);
+
+  const apiClient = useMemo(() => axios.create({
+    headers: session?.token ? { Authorization: `Bearer ${session.token}` } : {},
+  }), [session?.token]);
+
+  const handleAuthenticated = useCallback((nextSession) => {
+    window.localStorage.setItem(SESSION_KEY, JSON.stringify(nextSession));
+    setSession(nextSession);
+    setPage('dashboard');
+  }, []);
+
+  const handleAuthExpired = useCallback(() => {
+    window.localStorage.removeItem(SESSION_KEY);
+    setSession(null);
+    setJobs([]);
+    setStats({ total: 0, completed: 0, malicious: 0, queued: 0 });
+    setActiveJobId(null);
+    setReportHash(null);
+    setPage('dashboard');
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    handleAuthExpired();
+  }, [handleAuthExpired]);
 
   // Load jobs
   const loadJobs = useCallback(async () => {
+    if (!session?.token) return;
     try {
-      const res = await axios.get(`${API_BASE}/jobs?per_page=50`);
+      const res = await apiClient.get(`${API_BASE}/jobs?per_page=50`);
       setJobs(res.data.jobs || []);
       const all = res.data.jobs || [];
       setStats({
@@ -525,15 +653,18 @@ export default function Home() {
         queued: all.filter(j => j.status === 'QUEUED' || j.status === 'ANALYZING').length,
       });
     } catch (err) {
-      // API might not be up yet
+      if (err.response?.status === 401) {
+        handleAuthExpired();
+      }
     }
-  }, []);
+  }, [apiClient, handleAuthExpired, session?.token]);
 
   useEffect(() => {
+    if (!session?.token) return;
     loadJobs();
     const interval = setInterval(loadJobs, 10000);
     return () => clearInterval(interval);
-  }, [loadJobs]);
+  }, [loadJobs, session?.token]);
 
   // Handle file upload
   const handleFileUpload = async (file) => {
@@ -541,10 +672,14 @@ export default function Home() {
     try {
       const formData = new FormData();
       formData.append('file', file);
-      const res = await axios.post(`${API_BASE}/analyze`, formData);
+      const res = await apiClient.post(`${API_BASE}/analyze`, formData);
       setActiveJobId(res.data.job_id);
       setPage('progress');
     } catch (err) {
+      if (err.response?.status === 401) {
+        handleAuthExpired();
+        return;
+      }
       alert(err.response?.data?.detail || 'Upload failed');
     }
     setUploading(false);
@@ -577,9 +712,22 @@ export default function Home() {
   // Format date
   const formatDate = (d) => new Date(d).toLocaleString();
 
+  if (!authReady) {
+    return <div style={{ textAlign: 'center', padding: 60 }}><div className="spinner" style={{ margin: '0 auto' }} /></div>;
+  }
+
+  if (!session) {
+    return <AuthPanel onAuthenticated={handleAuthenticated} />;
+  }
+
   return (
     <div className="app-layout">
-      <Sidebar currentPage={page} onNavigate={(p) => { setPage(p); setReportHash(null); setActiveJobId(null); }} />
+      <Sidebar
+        currentPage={page}
+        onNavigate={(p) => { setPage(p); setReportHash(null); setActiveJobId(null); }}
+        session={session}
+        onLogout={handleLogout}
+      />
 
       <main className="main-content">
         {/* ── Dashboard ──────────────────────────────────── */}
@@ -661,7 +809,7 @@ export default function Home() {
               <h1 className="page-title">Analysis in Progress</h1>
               <p className="page-subtitle">SENTINEL is examining your file</p>
             </div>
-            <AnalysisProgress jobId={activeJobId} onComplete={handleComplete} />
+            <AnalysisProgress jobId={activeJobId} onComplete={handleComplete} apiClient={apiClient} onAuthExpired={handleAuthExpired} />
           </div>
         )}
 
@@ -672,7 +820,13 @@ export default function Home() {
               <h1 className="page-title">Threat Report</h1>
               <p className="page-subtitle">Detailed analysis findings</p>
             </div>
-            <ReportView reportHash={reportHash} onBack={() => setPage('dashboard')} onRefreshQueued={handleRefreshQueued} />
+            <ReportView
+              reportHash={reportHash}
+              onBack={() => setPage('dashboard')}
+              onRefreshQueued={handleRefreshQueued}
+              apiClient={apiClient}
+              onAuthExpired={handleAuthExpired}
+            />
           </div>
         )}
 

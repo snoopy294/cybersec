@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from typing import Optional
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Body
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc, text
 
@@ -37,7 +38,7 @@ from app.services.file_service import (
     storage_health_status,
     upload_file as store_file,
 )
-from app.services.auth_service import hash_password, verify_password, create_access_token
+from app.services.auth_service import hash_password, verify_password, create_access_token, decode_access_token
 from app.services.detection_service import (
     DETECTION_STRICTNESS_LEVELS,
     DETECTION_TARGETS,
@@ -46,6 +47,7 @@ from app.services.detection_service import (
 from app.services.graph_service import build_relationship_graph
 
 settings = get_settings()
+bearer_scheme = HTTPBearer(auto_error=False)
 
 router = APIRouter(prefix="/api/v1", tags=["SENTINEL API"])
 auth_router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
@@ -54,10 +56,45 @@ auth_router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
 def _latest_report_query(file_hash: str):
     return (
         select(ThreatReport)
+        .join(AnalysisJob, ThreatReport.job_id == AnalysisJob.id)
         .where(ThreatReport.file_hash_sha256 == file_hash)
         .order_by(desc(ThreatReport.created_at))
         .limit(1)
     )
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    if not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    payload = decode_access_token(credentials.credentials)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user_id = payload.get("sub")
+    tenant_id = payload.get("tenant_id")
+    if not user_id or not tenant_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    try:
+        user_uuid = UUID(user_id)
+        tenant_uuid = UUID(tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Invalid token payload") from exc
+
+    result = await db.execute(
+        select(User).where(
+            User.id == user_uuid,
+            User.tenant_id == tenant_uuid,
+            User.is_active.is_(True),
+        )
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    return user
 
 
 # ── Health ───────────────────────────────────────────────────────
@@ -125,7 +162,7 @@ async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == data.email))
     user = result.scalar_one_or_none()
 
-    if not user or not verify_password(data.password, user.password_hash):
+    if not user or not user.is_active or not verify_password(data.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_access_token(user.id, user.tenant_id)
@@ -143,6 +180,7 @@ async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
 async def upload_file(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Upload a file for threat analysis.
 
@@ -174,6 +212,7 @@ async def upload_file(
             ThreatReport, ThreatReport.job_id == AnalysisJob.id
         ).where(
             AnalysisJob.file_hash_sha256 == hashes["sha256"],
+            AnalysisJob.tenant_id == current_user.tenant_id,
             AnalysisJob.status == JobStatus.COMPLETED,
         ).order_by(desc(AnalysisJob.completed_at))
     )
@@ -190,18 +229,10 @@ async def upload_file(
                 poll_url=f"/api/v1/analyze/{existing_job.id}",
             )
 
-    # Use a default tenant for now (will be replaced with auth context)
-    result = await db.execute(select(Tenant).limit(1))
-    tenant = result.scalar_one_or_none()
-    if not tenant:
-        tenant = Tenant(name="Default", tier=TenantTier.FREE)
-        db.add(tenant)
-        await db.flush()
-
     # Store file (local filesystem or MinIO depending on config)
     try:
         object_path = store_file(
-            tenant_id=str(tenant.id),
+            tenant_id=str(current_user.tenant_id),
             sha256_hash=hashes["sha256"],
             file_name=file.filename or "unknown",
             file_bytes=file_bytes,
@@ -212,7 +243,7 @@ async def upload_file(
 
     # Create job record
     job = AnalysisJob(
-        tenant_id=tenant.id,
+        tenant_id=current_user.tenant_id,
         file_name=file.filename or "unknown",
         file_size_bytes=file_size,
         file_hash_sha256=hashes["sha256"],
@@ -240,9 +271,18 @@ async def upload_file(
 
 
 @router.get("/analyze/{job_id}", response_model=AnalysisJobDetail)
-async def get_job_status(job_id: UUID, db: AsyncSession = Depends(get_db)):
+async def get_job_status(
+    job_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Poll the status of an analysis job."""
-    result = await db.execute(select(AnalysisJob).where(AnalysisJob.id == job_id))
+    result = await db.execute(
+        select(AnalysisJob).where(
+            AnalysisJob.id == job_id,
+            AnalysisJob.tenant_id == current_user.tenant_id,
+        )
+    )
     job = result.scalar_one_or_none()
 
     if not job:
@@ -272,9 +312,10 @@ async def list_jobs(
     per_page: int = Query(20, ge=1, le=100),
     status: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """List all analysis jobs with pagination and optional status filter."""
-    query = select(AnalysisJob)
+    query = select(AnalysisJob).where(AnalysisJob.tenant_id == current_user.tenant_id)
 
     if status:
         try:
@@ -318,9 +359,15 @@ async def list_jobs(
 
 
 @router.get("/report/{file_hash}", response_model=ThreatReportResponse)
-async def get_report(file_hash: str, db: AsyncSession = Depends(get_db)):
+async def get_report(
+    file_hash: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Get a threat report by file SHA-256 hash."""
-    result = await db.execute(_latest_report_query(file_hash))
+    result = await db.execute(
+        _latest_report_query(file_hash).where(AnalysisJob.tenant_id == current_user.tenant_id)
+    )
     report = result.scalar_one_or_none()
 
     if not report:
@@ -342,11 +389,18 @@ async def get_report(file_hash: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/report/{file_hash}/refresh", response_model=AnalysisJobResponse, status_code=202)
-async def refresh_report(file_hash: str, db: AsyncSession = Depends(get_db)):
+async def refresh_report(
+    file_hash: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Queue a fresh analysis run for an existing uploaded file."""
     result = await db.execute(
         select(AnalysisJob)
-        .where(AnalysisJob.file_hash_sha256 == file_hash)
+        .where(
+            AnalysisJob.file_hash_sha256 == file_hash,
+            AnalysisJob.tenant_id == current_user.tenant_id,
+        )
         .order_by(desc(AnalysisJob.created_at))
         .limit(1)
     )
@@ -382,9 +436,15 @@ async def refresh_report(file_hash: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/report/{file_hash}/similar", response_model=BehaviorSimilarityResponse)
-async def get_behavior_similarity(file_hash: str, db: AsyncSession = Depends(get_db)):
+async def get_behavior_similarity(
+    file_hash: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Return behavior similarity matches from the latest report."""
-    result = await db.execute(_latest_report_query(file_hash))
+    result = await db.execute(
+        _latest_report_query(file_hash).where(AnalysisJob.tenant_id == current_user.tenant_id)
+    )
     report = result.scalar_one_or_none()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -408,9 +468,12 @@ async def generate_detection_pack(
     file_hash: str,
     payload: Optional[DetectionPackRequest] = Body(default=None),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Generate draft detection artifacts from report evidence."""
-    result = await db.execute(_latest_report_query(file_hash))
+    result = await db.execute(
+        _latest_report_query(file_hash).where(AnalysisJob.tenant_id == current_user.tenant_id)
+    )
     report = result.scalar_one_or_none()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -434,9 +497,12 @@ async def submit_analyst_feedback(
     file_hash: str,
     payload: AnalystFeedbackRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Attach analyst feedback to a living report."""
-    result = await db.execute(_latest_report_query(file_hash))
+    result = await db.execute(
+        _latest_report_query(file_hash).where(AnalysisJob.tenant_id == current_user.tenant_id)
+    )
     report = result.scalar_one_or_none()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -479,6 +545,7 @@ async def get_graph_relationships(
     entity_id: str = Query(...),
     depth: int = Query(1, ge=1, le=2),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Return report-derived graph relationships for files, behaviors, and IOCs."""
     normalized_type = entity_type.lower()
@@ -486,7 +553,9 @@ async def get_graph_relationships(
         raise HTTPException(status_code=400, detail="entity_type must be file, behavior, or ioc")
 
     if normalized_type == "file":
-        result = await db.execute(_latest_report_query(entity_id))
+        result = await db.execute(
+            _latest_report_query(entity_id).where(AnalysisJob.tenant_id == current_user.tenant_id)
+        )
         report = result.scalar_one_or_none()
         if not report:
             raise HTTPException(status_code=404, detail="Report not found")
@@ -494,6 +563,8 @@ async def get_graph_relationships(
     else:
         result = await db.execute(
             select(ThreatReport)
+            .join(AnalysisJob, ThreatReport.job_id == AnalysisJob.id)
+            .where(AnalysisJob.tenant_id == current_user.tenant_id)
             .order_by(desc(ThreatReport.created_at))
             .limit(250)
         )

@@ -567,6 +567,7 @@ def _find_behavior_matches(session, current_job, static_data: dict, iocs_dict: d
         session.query(ThreatReport, AnalysisJob)
         .join(AnalysisJob, ThreatReport.job_id == AnalysisJob.id)
         .filter(ThreatReport.file_hash_sha256 != current_job.file_hash_sha256)
+        .filter(AnalysisJob.tenant_id == current_job.tenant_id)
         .filter(AnalysisJob.status == JobStatus.COMPLETED)
         .order_by(ThreatReport.created_at.desc())
         .limit(250)
