@@ -29,6 +29,11 @@ out/
 pgdata/
 miniodata/
 
+# Local runtime analysis data
+sentinel.db
+backend/sentinel.db
+backend/storage/
+
 # OS
 .DS_Store
 Thumbs.db

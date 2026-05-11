@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.core.database import engine, Base
 from app.api.routes import router, auth_router
+from app.services.file_service import validate_storage_configuration
 
 settings = get_settings()
 
@@ -18,6 +19,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — create tables on startup."""
+    validate_storage_configuration()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
@@ -39,7 +41,7 @@ app = FastAPI(
 # ── CORS Middleware ──────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

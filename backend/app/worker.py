@@ -11,10 +11,14 @@ Supports two modes:
   - Celery (optional): Distributed via Redis broker
 """
 
+import hashlib
+import json
 import re
 import struct
 import threading
+from collections import Counter
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -28,6 +32,7 @@ except ImportError:  # pragma: no cover - fallback keeps local dev usable before
     pefile = None
 
 settings = get_settings()
+ANALYZER_VERSION = "behavior-v5"
 
 # Synchronous DB session for the analysis worker
 sync_engine = create_engine(settings.DATABASE_URL_SYNC, connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL_SYNC else {})
@@ -36,8 +41,8 @@ SyncSession = sessionmaker(bind=sync_engine)
 
 # ── Static Analysis Helpers ──────────────────────────────────────
 
-MAX_SCAN_BYTES = 2_000_000
-MAX_STRINGS = 750
+MAX_SCAN_BYTES = 16 * 1024 * 1024
+MAX_STRINGS = 5000
 MAX_IMPORT_FUNCTIONS = 400
 
 DOMAIN_RE = re.compile(
@@ -69,32 +74,41 @@ SUSPICIOUS_IMPORTS = {
 
 
 def _extract_strings(data: bytes, min_length: int = 4) -> list[dict]:
-    """Extract printable ASCII and UTF-16LE strings from binary data."""
-    scan_data = data[:MAX_SCAN_BYTES]
+    """Extract ASCII and UTF-16LE strings, prioritizing behavior evidence."""
     results = []
+    seen_values = set()
+    scan = data[:MAX_SCAN_BYTES]
 
-    ascii_pattern = re.compile(rb"[\x20-\x7e]{%d,}" % min_length)
-    for match in ascii_pattern.finditer(scan_data):
-        value = match.group().decode("ascii", errors="ignore")
+    def add_string(value: str, encoding: str, offset: int):
+        value = value.strip()
+        if len(value) < min_length:
+            return
+        if len(value) > 2048:
+            value = value[:2048]
+        dedupe_key = value.lower()
+        if dedupe_key in seen_values:
+            return
+        seen_values.add(dedupe_key)
+        classification = _classify_string(value)
         results.append({
             "value": value,
-            "encoding": "ascii",
-            "offset": match.start(),
-            "classification": _classify_string(value),
+            "encoding": encoding,
+            "offset": offset,
+            "classification": classification,
+            "priority": _string_priority(value, classification),
         })
 
-    utf16_pattern = re.compile((rb"(?:[\x20-\x7e]\x00){%d,}") % min_length)
-    for match in utf16_pattern.finditer(scan_data):
-        value = match.group().decode("utf-16le", errors="ignore").rstrip("\x00")
-        if value:
-            results.append({
-                "value": value,
-                "encoding": "utf-16le",
-                "offset": match.start(),
-                "classification": _classify_string(value),
-            })
+    ascii_pattern = re.compile(rb'[\x20-\x7e]{%d,}' % min_length)
+    for match in ascii_pattern.finditer(scan):
+        add_string(match.group().decode('ascii', errors='ignore'), "ascii", match.start())
 
-    results.sort(key=lambda item: item["offset"])
+    utf16_pattern = re.compile(rb'(?:[\x20-\x7e]\x00){%d,}' % min_length)
+    for match in utf16_pattern.finditer(scan):
+        add_string(match.group().decode('utf-16le', errors='ignore'), "utf-16le", match.start())
+
+    results.sort(key=lambda item: (-item["priority"], item["offset"]))
+    for item in results:
+        item.pop("priority", None)
     return results[:MAX_STRINGS]
 
 
@@ -102,16 +116,23 @@ def _classify_string(s: str) -> str:
     """Classify a string as an IOC type."""
     normalized = s.strip().strip("\"'<>[](){}")
 
-    if URL_RE.match(normalized):
+    if URL_RE.match(normalized) or re.search(r'https?://', s, re.IGNORECASE):
         return "URL"
-    if _is_valid_ipv4(normalized):
+
+    ip_matches = re.findall(r'\b\d{1,3}(?:\.\d{1,3}){3}\b', normalized)
+    if any(_is_valid_ipv4(match) for match in ip_matches):
         return "IP_ADDRESS"
-    if EMAIL_RE.match(normalized):
+
+    if EMAIL_RE.match(normalized) or re.search(r'\b[^@\s]+@[^@\s]+\.[^@\s]+\b', s):
         return "EMAIL"
-    if normalized.upper().startswith("HKEY_") or "SOFTWARE\\" in normalized.upper():
+    if re.search(r'\b(HKEY_|HKLM\\|HKCU\\|SOFTWARE\\)', s, re.IGNORECASE):
         return "REGISTRY_KEY"
     if WINDOWS_PATH_RE.match(normalized) or "/.." in normalized:
         return "FILE_PATH"
+    if re.search(r'\b(whoami|ipconfig|net user|schtasks|reg query|powershell|cmd\.exe)\b', s, re.IGNORECASE):
+        return "COMMAND"
+    if re.search(r'\bSe[A-Za-z]+Privilege\b', s):
+        return "WINDOWS_PRIVILEGE"
     if BTC_RE.match(normalized) or ETH_RE.match(normalized):
         return "CRYPTO_WALLET"
     if DOMAIN_RE.match(normalized):
@@ -127,6 +148,76 @@ def _is_valid_ipv4(value: str) -> bool:
         return all(part.isdigit() and 0 <= int(part) <= 255 for part in parts)
     except ValueError:
         return False
+
+
+def _string_priority(value: str, classification: str) -> int:
+    """Rank strings so report samples contain analyst-useful evidence."""
+    score = 0
+    if classification != "UNKNOWN":
+        score += 50
+
+    lowered = value.lower()
+    interesting_terms = [
+        "password", "credential", "token", "secret", "lsass", "sam", "winlogon",
+        "alwaysinstallelevated", "seimpersonate", "namedpipe", "unquoted service",
+        "currentversion\\run", "schtasks", "whoami", "ipconfig", "net user",
+        "reg query", "hkey_", "software\\microsoft\\windows", "startup",
+        "autologon", "privilege", "service", "process", "registry",
+    ]
+    score += sum(10 for term in interesting_terms if term in lowered)
+
+    for rule in BEHAVIOR_RULES.values():
+        if any(pattern.lower() in lowered for pattern in rule["patterns"]):
+            score += 15
+            break
+
+    return score
+
+
+def _extract_ioc_values(value: str, classification: str) -> list[str]:
+    """Extract normalized IOC tokens from a classified string."""
+    if classification == "URL":
+        urls = []
+        for item in re.findall(r'https?://[^\s`"\'<>]+', value, re.IGNORECASE):
+            item = item.rstrip(".,;)'\"]")
+            parsed = urlparse(item)
+            host = parsed.hostname or ""
+            if parsed.hostname and len(item) <= 300 and ("." in host or host in {"localhost"}):
+                urls.append(item)
+        return urls
+    if classification == "IP_ADDRESS":
+        if len(value) > 300:
+            return []
+        lowered = value.lower()
+        if any(marker in lowered for marker in ("version=", "publickeytoken", "assemblyidentity")):
+            return []
+        ips = []
+        for item in re.findall(r'\b\d{1,3}(?:\.\d{1,3}){3}\b', value):
+            octets = [int(part) for part in item.split(".")]
+            if all(0 <= part <= 255 for part in octets):
+                ips.append(item)
+        return ips
+    if classification == "EMAIL":
+        return re.findall(r'\b[^@\s]+@[^@\s]+\.[^@\s]+\b', value)
+    if classification == "REGISTRY_KEY" and len(value) > 300:
+        return []
+    return [value]
+
+
+def _ioc_values(strings: list[dict], classification: str) -> list[str]:
+    """Return normalized, de-duplicated IOC values by classification."""
+    values = []
+    seen = set()
+    for item in strings:
+        if item["classification"] != classification:
+            continue
+        for value in _extract_ioc_values(item["value"], classification):
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append(value)
+    return values
 
 
 def _analyze_pe_headers(data: bytes) -> dict | None:
@@ -300,6 +391,415 @@ def _pe_summary_for_report(pe_info: dict | None) -> dict | None:
     return {key: value for key, value in pe_info.items() if key not in excluded}
 
 
+BEHAVIOR_RULES = {
+    "network_communications": {
+        "patterns": [
+            "http://", "https://", "ws2_32", "wininet", "winhttp", "internetopen",
+            "internetconnect", "httpopenrequest", "urldownloadtofile", "getaddrinfo",
+            "socket", "connect", "send", "recv",
+        ],
+        "mitre": ["T1071"],
+        "label": "Network or command-and-control communications",
+    },
+    "persistence": {
+        "patterns": [
+            "\\currentversion\\run", "\\currentversion\\runonce", "startup",
+            "schtasks", "createservice", "openservice", "startservice",
+            "setwindowshookex", "runservices",
+        ],
+        "mitre": ["T1060", "T1053", "T1543"],
+        "label": "Persistence through startup, scheduled task, or service hooks",
+    },
+    "process_injection": {
+        "patterns": [
+            "virtualallocex", "writeprocessmemory", "createremotethread",
+            "ntmapviewofsection", "queueuserapc", "setthreadcontext",
+            "rtlcreateuserthread",
+        ],
+        "mitre": ["T1055"],
+        "label": "Process injection or remote memory manipulation",
+    },
+    "defense_evasion": {
+        "patterns": [
+            "isdebuggerpresent", "checkremotedebuggerpresent", "ntqueryinformationprocess",
+            "virtualprotect", "loadlibrary", "getprocaddress", "sleep", "upx",
+            "themida", "vmprotect",
+        ],
+        "mitre": ["T1027", "T1497"],
+        "label": "Defense evasion, packing, or anti-analysis behavior",
+    },
+    "credential_access": {
+        "patterns": [
+            "cryptunprotectdata", "credenumerate", "lsass", "sam\\", "sekurlsa",
+            "logonpasswords", "advapi32", "vaultcli", "password", "credential",
+            "autologon", "winlogon", "dpapi", "masterkey", "vault", "secret",
+        ],
+        "mitre": ["T1003", "T1555"],
+        "label": "Credential or secret access",
+    },
+    "system_discovery": {
+        "patterns": [
+            "enumprocesses", "createtoolhelp32snapshot", "process32first",
+            "process32next", "getusername", "getcomputername", "systeminfo",
+            "ipconfig", "whoami", "net view", "net user", "net localgroup",
+        ],
+        "mitre": ["T1057", "T1082", "T1033"],
+        "label": "Host, user, process, or network discovery",
+    },
+    "privilege_escalation_audit": {
+        "patterns": [
+            "alwaysinstallelevated", "seimpersonateprivilege", "seassignprimaryprivilege",
+            "sebackupprivilege", "serestoreprivilege", "secreatetokenprivilege",
+            "unquoted service", "modifiable service", "namedpipe", "autologon",
+            "token manipulation",
+        ],
+        "mitre": ["T1068", "T1134"],
+        "label": "Privilege escalation or misconfiguration auditing",
+    },
+    "registry_modification": {
+        "patterns": [
+            "regopenkey", "regsetvalue", "regcreatekey", "regdeletevalue",
+            "hkey_", "software\\microsoft\\windows",
+        ],
+        "mitre": ["T1112"],
+        "label": "Registry inspection or modification",
+    },
+    "file_system_activity": {
+        "patterns": [
+            "createfile", "writefile", "deletefile", "copyfile", "movefile",
+            "gettemppath", "\\temp\\", "appdata", "programdata",
+        ],
+        "mitre": ["T1105", "T1036"],
+        "label": "File staging, writing, or cleanup activity",
+    },
+    "destructive_or_ransomware": {
+        "patterns": [
+            "vssadmin delete shadows", "wbadmin delete", "bcdedit /set",
+            "delete shadows", "recover your files",
+        ],
+        "mitre": ["T1486", "T1490"],
+        "label": "Destructive, recovery-inhibiting, or ransomware-like behavior",
+    },
+}
+
+
+def _ioc_hosts(iocs_dict: dict) -> list[str]:
+    """Normalize IOC URLs/IPs into host-like comparison tokens."""
+    hosts = []
+    seen = set()
+
+    def add_host(host: str):
+        key = host.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        hosts.append(key)
+
+    for url in iocs_dict.get("urls", []):
+        parsed = urlparse(url)
+        if parsed.hostname:
+            add_host(parsed.hostname)
+
+    for ip in iocs_dict.get("ips", []):
+        if _is_contextual_ip(ip):
+            add_host(ip)
+
+    return hosts
+
+
+def _is_contextual_ip(ip: str) -> bool:
+    """Keep IPs likely to represent network targets, not versions or OIDs."""
+    try:
+        octets = [int(part) for part in ip.split(".")]
+    except ValueError:
+        return False
+    if len(octets) != 4:
+        return False
+    if octets[0] in (0, 10, 127):
+        return True
+    if octets[0] == 172 and 16 <= octets[1] <= 31:
+        return True
+    if octets[0] == 192 and octets[1] == 168:
+        return True
+    if octets[:2] in ([8, 8], [9, 9]):
+        return True
+    if octets[0] >= 11 and ip not in {"255.255.255.255"}:
+        return True
+    return False
+
+
+def _build_behavior_profile(strings: list[dict], iocs_dict: dict, entropy: float, pe_info: dict | None) -> dict:
+    """Infer behavior capabilities from static strings and PE metadata."""
+    searchable = []
+    for item in strings:
+        value = item.get("value", "")
+        if value:
+            searchable.append(value)
+
+    capabilities = []
+    all_text = "\n".join(searchable).lower()
+
+    for name, rule in BEHAVIOR_RULES.items():
+        evidence = []
+        for pattern in rule["patterns"]:
+            pattern_l = pattern.lower()
+            if pattern_l in all_text:
+                evidence.append(pattern)
+
+        if name == "network_communications":
+            evidence.extend(_ioc_hosts(iocs_dict))
+        if name == "defense_evasion" and entropy > 7.0:
+            evidence.append(f"entropy:{entropy}")
+        if name == "registry_modification" and iocs_dict.get("registry_keys"):
+            evidence.extend(iocs_dict["registry_keys"][:5])
+
+        deduped = list(dict.fromkeys(evidence))
+        if deduped:
+            confidence = min(0.95, 0.35 + (0.12 * len(deduped)))
+            capabilities.append({
+                "name": name,
+                "label": rule["label"],
+                "confidence": round(confidence, 2),
+                "evidence": deduped[:10],
+                "evidence_refs": [
+                    {
+                        "type": "static_string_or_indicator",
+                        "value": item,
+                        "producer": "sentinel-analysis-worker",
+                        "analyzer_version": ANALYZER_VERSION,
+                    }
+                    for item in deduped[:10]
+                ],
+                "mitre": rule["mitre"],
+            })
+
+    capability_names = sorted(c["name"] for c in capabilities)
+    mitre = sorted({tech for c in capabilities for tech in c["mitre"]})
+    api_tokens = _extract_api_tokens(strings)
+
+    fingerprint_payload = {
+        "capabilities": capability_names,
+        "ioc_hosts": _ioc_hosts(iocs_dict),
+        "api_tokens": api_tokens[:100],
+        "pe_machine": pe_info.get("machine") if pe_info else None,
+        "pe_sections": pe_info.get("num_sections") if pe_info else None,
+        "entropy_bucket": _entropy_bucket(entropy),
+    }
+
+    return {
+        "capabilities": capabilities,
+        "capability_names": capability_names,
+        "api_tokens": api_tokens[:100],
+        "ioc_hosts": fingerprint_payload["ioc_hosts"],
+        "mitre": mitre,
+        "semantic_fingerprint": hashlib.sha256(
+            json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "fingerprint_payload": fingerprint_payload,
+    }
+
+
+def _has_strong_malicious_signal(behavior_profile: dict) -> bool:
+    """Require specific high-risk evidence before labeling a file malicious."""
+    destructive_terms = {"bcdedit /set", "recover your files", "vssadmin delete shadows", "wbadmin delete"}
+    credential_terms = {"logonpasswords", "lsass", "sekurlsa"}
+    injection_terms = {"createremotethread", "ntmapviewofsection", "queueuserapc", "rtlcreateuserthread"}
+    for capability in behavior_profile.get("capabilities") or []:
+        name = capability.get("name")
+        evidence = " ".join(str(item).lower() for item in capability.get("evidence") or [])
+        if name == "destructive_or_ransomware" and any(term in evidence for term in destructive_terms):
+            return True
+        if name == "credential_access" and any(term in evidence for term in credential_terms):
+            return True
+        if name == "process_injection" and any(term in evidence for term in injection_terms):
+            return True
+    return False
+
+
+def _benign_software_context(file_name: str, strings: list[dict]) -> list[str]:
+    """Find soft evidence that a sample is a legitimate packaged app."""
+    haystack = "\n".join(
+        [file_name.lower()]
+        + [str(item.get("value", "")).lower() for item in strings[:1000]]
+    )
+    terms = [
+        "anthropic", "claude", "electron", "app.asar", "node.js", "chromium",
+        "squirrel", "crashpad", "microsoft corporation", "github", "visual studio code",
+    ]
+    return [term for term in terms if term in haystack]
+
+
+DEPENDENCY_REPOSITORY_HOSTS = {
+    "pypi.org",
+    "files.pythonhosted.org",
+    "pythonhosted.org",
+    "registry.npmjs.org",
+    "npmjs.org",
+    "registry.yarnpkg.com",
+    "yarnpkg.com",
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "search.maven.org",
+    "plugins.gradle.org",
+    "api.nuget.org",
+    "nuget.org",
+    "globalcdn.nuget.org",
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    "proxy.golang.org",
+    "sum.golang.org",
+    "rubygems.org",
+    "packagist.org",
+    "repo.packagist.org",
+    "conda.anaconda.org",
+    "repo.anaconda.com",
+}
+
+
+def _dependency_install_context(file_name: str, strings: list[dict], urls: list[str]) -> list[str]:
+    """Find evidence that network/file access is package installation or dependency resolution."""
+    haystack = "\n".join(
+        [file_name.lower()]
+        + [str(item.get("value", "")).lower() for item in strings[:1500]]
+        + [url.lower() for url in urls]
+    )
+    terms = [
+        "package.json", "package-lock.json", "npm-shrinkwrap", "node_modules",
+        "npm install", "npm ci", "yarn.lock", "yarn install", "pnpm-lock.yaml",
+        "pnpm install", "registry.npmjs.org",
+        "requirements.txt", "pip install", "pyproject.toml", "setup.py",
+        "poetry.lock", "pipfile.lock", "site-packages", ".dist-info", ".whl",
+        "pypi.org", "files.pythonhosted.org",
+        "pom.xml", "build.gradle", "gradle-wrapper", "repo.maven.apache.org",
+        "nuget.config", "packages.config", ".nupkg", "api.nuget.org",
+        "cargo.toml", "cargo.lock", "crates.io",
+        "go.mod", "go.sum", "proxy.golang.org",
+        "composer.json", "composer.lock", "packagist.org",
+        "environment.yml", "conda install", "conda-forge",
+    ]
+    return [term for term in terms if term in haystack]
+
+
+def _dependency_repository_urls(urls: list[str]) -> list[str]:
+    """Return URLs that point at common package repositories rather than app-controlled endpoints."""
+    dependency_urls = []
+    for url in urls:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host in DEPENDENCY_REPOSITORY_HOSTS:
+            dependency_urls.append(url)
+            continue
+        if host.endswith(".pkg.github.com") or host.endswith(".jfrog.io"):
+            dependency_urls.append(url)
+            continue
+        if any(marker in path for marker in (
+            "/simple/", "/packages/", "/npm/", "/maven2/", "/nuget/",
+            "/crates/", "/composer/", "/pypi/", "/artifactory/",
+        )):
+            dependency_urls.append(url)
+    return dependency_urls
+
+
+def _extract_api_tokens(strings: list[dict]) -> list[str]:
+    """Pull Windows-looking API names from extracted strings."""
+    counter = Counter()
+    api_pattern = re.compile(r"\b[A-Z][A-Za-z0-9]{4,}(?:A|W)?\b")
+    for item in strings:
+        value = item.get("value", "")
+        for token in api_pattern.findall(value):
+            if any(keyword in token.lower() for keyword in (
+                "process", "thread", "file", "registry", "internet", "crypt",
+                "token", "service", "window", "memory", "module",
+            )):
+                counter[token.lower()] += 1
+    return [token for token, _ in counter.most_common(100)]
+
+
+def _entropy_bucket(entropy: float) -> str:
+    if entropy >= 7.3:
+        return "very_high"
+    if entropy >= 7.0:
+        return "high"
+    if entropy >= 6.0:
+        return "medium"
+    return "low"
+
+
+def _jaccard(left: set, right: set) -> float:
+    if not left and not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _find_behavior_matches(session, current_job, static_data: dict, iocs_dict: dict) -> dict:
+    """Compare the current sample against previously completed reports."""
+    from app.models.models import AnalysisJob, ThreatReport, JobStatus
+
+    current_profile = static_data.get("behavior_profile") or {}
+    current_caps = set(current_profile.get("capability_names") or [])
+    current_apis = set(current_profile.get("api_tokens") or [])
+    current_hosts = set(current_profile.get("ioc_hosts") or [])
+    current_entropy_bucket = _entropy_bucket(static_data.get("entropy", 0.0))
+
+    candidates = (
+        session.query(ThreatReport, AnalysisJob)
+        .join(AnalysisJob, ThreatReport.job_id == AnalysisJob.id)
+        .filter(ThreatReport.file_hash_sha256 != current_job.file_hash_sha256)
+        .filter(AnalysisJob.tenant_id == current_job.tenant_id)
+        .filter(AnalysisJob.status == JobStatus.COMPLETED)
+        .order_by(ThreatReport.created_at.desc())
+        .limit(250)
+        .all()
+    )
+
+    matches = []
+    for report, job in candidates:
+        previous_static = report.static_data or {}
+        previous_profile = previous_static.get("behavior_profile") or {}
+
+        previous_caps = set(previous_profile.get("capability_names") or [])
+        previous_apis = set(previous_profile.get("api_tokens") or [])
+        previous_hosts = set(previous_profile.get("ioc_hosts") or [])
+
+        behavior_similarity = _jaccard(current_caps, previous_caps)
+        api_similarity = _jaccard(current_apis, previous_apis)
+        ioc_similarity = _jaccard(current_hosts, previous_hosts)
+        entropy_match = 1.0 if current_entropy_bucket == _entropy_bucket(previous_static.get("entropy", 0.0)) else 0.0
+
+        similarity = (
+            behavior_similarity * 0.55
+            + api_similarity * 0.20
+            + ioc_similarity * 0.20
+            + entropy_match * 0.05
+        )
+
+        if similarity < 0.18:
+            continue
+
+        matches.append({
+            "file_name": job.file_name,
+            "file_hash_sha256": report.file_hash_sha256,
+            "verdict": report.verdict,
+            "severity_score": report.severity_score,
+            "created_at": report.created_at.isoformat() if report.created_at else None,
+            "similarity_score": round(similarity * 100),
+            "matched_behaviors": sorted(current_caps & previous_caps),
+            "shared_api_tokens": sorted(current_apis & previous_apis)[:20],
+            "shared_iocs": sorted(current_hosts & previous_hosts)[:20],
+        })
+
+    matches.sort(key=lambda item: item["similarity_score"], reverse=True)
+    return {
+        "match_count": len(matches),
+        "top_matches": matches[:5],
+        "method": "behavior+jaccard:v1",
+    }
+
+
 # ── Core Analysis Function ───────────────────────────────────────
 
 def run_analysis(job_id: str):
@@ -341,25 +841,48 @@ def run_analysis(job_id: str):
         entropy = _compute_entropy(file_data)
 
         ioc_strings = [s for s in strings if s["classification"] != "UNKNOWN"]
+        iocs_dict = {
+            "urls": _ioc_values(ioc_strings, "URL"),
+            "ips": _ioc_values(ioc_strings, "IP_ADDRESS"),
+            "domains": _ioc_values(ioc_strings, "DOMAIN"),
+            "emails": _ioc_values(ioc_strings, "EMAIL"),
+            "registry_keys": _ioc_values(ioc_strings, "REGISTRY_KEY"),
+            "file_paths": _ioc_values(ioc_strings, "FILE_PATH"),
+            "commands": _ioc_values(ioc_strings, "COMMAND"),
+            "windows_privileges": _ioc_values(ioc_strings, "WINDOWS_PRIVILEGE"),
+            "crypto_wallets": _ioc_values(ioc_strings, "CRYPTO_WALLET"),
+        }
         high_entropy_sections = [
             section for section in (pe_info or {}).get("sections", [])
             if section.get("high_entropy")
         ]
         import_risks = _summarize_import_risks(pe_info)
+        behavior_profile = _build_behavior_profile(strings, iocs_dict, entropy, pe_info)
+        benign_context = _benign_software_context(job.file_name, strings)
+        dependency_context = _dependency_install_context(job.file_name, strings, iocs_dict["urls"])
+        dependency_urls = _dependency_repository_urls(iocs_dict["urls"])
+        has_strong_signal = _has_strong_malicious_signal(behavior_profile)
 
         static_data = {
+            "analyzer_version": ANALYZER_VERSION,
             "pe_headers": _pe_summary_for_report(pe_info),
             "pe_sections": (pe_info or {}).get("sections", []),
             "pe_imports": (pe_info or {}).get("imports", []),
             "pe_exports": (pe_info or {}).get("exports", []),
             "strings_count": len(strings),
-            "strings_sample": strings[:100],
+            "strings_sample": strings[:500],
             "iocs_extracted": ioc_strings,
             "entropy": entropy,
             "high_entropy": entropy > 7.0,
             "high_entropy_sections": high_entropy_sections,
             "import_risks": import_risks,
+            "behavior_profile": behavior_profile,
+            "benign_context": benign_context,
+            "dependency_install_context": dependency_context,
+            "dependency_repository_urls": dependency_urls[:50],
         }
+        cross_reference = _find_behavior_matches(session, job, static_data, iocs_dict)
+        static_data["cross_reference"] = cross_reference
 
         job.progress_percent = 60
         job.status = JobStatus.CORTEX_REASONING
@@ -370,7 +893,7 @@ def run_analysis(job_id: str):
         reasons = []
 
         if entropy > 7.0:
-            score += 20
+            score += 15
             reasons.append("High entropy suggests packed or encrypted content")
 
         if high_entropy_sections:
@@ -378,14 +901,22 @@ def run_analysis(job_id: str):
             section_names = ", ".join(section["name"] for section in high_entropy_sections[:5])
             reasons.append(f"High-entropy PE section(s): {section_names}")
 
-        url_count = len([s for s in ioc_strings if s["classification"] == "URL"])
-        ip_count = len([s for s in ioc_strings if s["classification"] == "IP_ADDRESS"])
-        domain_count = len([s for s in ioc_strings if s["classification"] == "DOMAIN"])
-        reg_count = len([s for s in ioc_strings if s["classification"] == "REGISTRY_KEY"])
+        url_count = len(iocs_dict["urls"])
+        ip_count = len(iocs_dict["ips"])
+        domain_count = len(iocs_dict["domains"])
+        reg_count = len(iocs_dict["registry_keys"])
+        scored_url_count = url_count
+        if dependency_context and dependency_urls and not has_strong_signal:
+            scored_url_count = max(0, url_count - len(dependency_urls))
+            reasons.append(
+                f"Recognized {len(dependency_urls)} package repository URL(s) as dependency-install context"
+            )
 
-        if url_count > 0:
-            score += min(url_count * 5, 20)
-            reasons.append(f"Contains {url_count} embedded URL(s)")
+        if scored_url_count > 0:
+            url_weight = 2 if dependency_context and not has_strong_signal else 3
+            url_cap = 6 if dependency_context and not has_strong_signal else 12
+            score += min(scored_url_count * url_weight, url_cap)
+            reasons.append(f"Contains {scored_url_count} non-package embedded URL(s)")
         if ip_count > 0:
             score += min(ip_count * 5, 15)
             reasons.append(f"Contains {ip_count} embedded IP address(es)")
@@ -393,12 +924,42 @@ def run_analysis(job_id: str):
             score += min(domain_count * 3, 12)
             reasons.append(f"Contains {domain_count} embedded domain(s)")
         if reg_count > 0:
-            score += min(reg_count * 10, 20)
+            reg_weight = 2 if dependency_context and not has_strong_signal else 5
+            reg_cap = 4 if dependency_context and not has_strong_signal else 10
+            score += min(reg_count * reg_weight, reg_cap)
             reasons.append(f"References {reg_count} registry key(s)")
 
         if import_risks:
             score += min(len(import_risks) * 8, 32)
             reasons.extend(import_risks)
+
+        behavior_names = set(behavior_profile.get("capability_names", []))
+        high_risk_behaviors = behavior_names & {
+            "process_injection",
+            "credential_access",
+            "persistence",
+            "destructive_or_ransomware",
+        }
+        if high_risk_behaviors:
+            risk_weight = 12 if has_strong_signal else 5
+            score += min(len(high_risk_behaviors) * risk_weight, 30 if has_strong_signal else 12)
+            reasons.append(
+                "Behavior profile matches high-risk capability group(s): "
+                + ", ".join(sorted(high_risk_behaviors))
+            )
+
+        best_match = (cross_reference.get("top_matches") or [None])[0]
+        if best_match:
+            match_score = best_match["similarity_score"]
+            match_verdict = str(best_match.get("verdict") or "").upper()
+            if match_verdict == "MALICIOUS" and match_score >= 70:
+                score += 20
+            elif match_verdict in {"MALICIOUS", "SUSPICIOUS"} and match_score >= 60:
+                score += 10
+            reasons.append(
+                f"Behaviorally similar to prior sample {best_match['file_name']} "
+                f"({match_score}% match, verdict {best_match['verdict']})"
+            )
 
         if pe_info and pe_info.get("is_pe"):
             score += 5
@@ -407,6 +968,21 @@ def run_analysis(job_id: str):
                 reasons.append("Unusual number of PE sections")
 
         score = min(score, 100)
+        benign_reducers = benign_context + dependency_context
+        if benign_reducers and not has_strong_signal:
+            reduction_cap = 40 if dependency_context else 30
+            score = max(0, score - min(reduction_cap, len(benign_reducers) * 8))
+            if dependency_context and not high_risk_behaviors:
+                score = min(score, 20)
+            if score < 45:
+                score = min(score, 25)
+            reasons.append(
+                "Legitimate software packaging or dependency-install context reduced confidence: "
+                + ", ".join(benign_reducers[:6])
+            )
+        if score >= 70 and not has_strong_signal:
+            score = 60
+            reasons.append("Score capped at suspicious because high-risk evidence is not specific enough for a malicious verdict")
 
         if score >= 70:
             verdict = Verdict.MALICIOUS
@@ -438,10 +1014,33 @@ def run_analysis(job_id: str):
                 narrative += f"- `{section['name']}` entropy {section['entropy']} / 8.0\n"
             narrative += "\n"
 
+        if behavior_profile["capabilities"]:
+            narrative += "### Behavior Profile\n"
+            for capability in behavior_profile["capabilities"][:8]:
+                evidence = ", ".join(capability["evidence"][:3])
+                narrative += (
+                    f"- {capability['label']} "
+                    f"({int(capability['confidence'] * 100)}% confidence"
+                )
+                if evidence:
+                    narrative += f"; evidence: `{evidence}`"
+                narrative += ")\n"
+            narrative += "\n"
+
+        if cross_reference["top_matches"]:
+            narrative += "### Historical Behavior Matches\n"
+            for match in cross_reference["top_matches"][:3]:
+                behaviors = ", ".join(match["matched_behaviors"][:4]) or "shared static traits"
+                narrative += (
+                    f"- {match['similarity_score']}% similar to `{match['file_name']}` "
+                    f"({match['verdict']}, score {match['severity_score']}): {behaviors}\n"
+                )
+            narrative += "\n"
+
         if reasons:
             narrative += "### Risk Indicators\n"
             for r in reasons:
-                narrative += f"- ⚠️ {r}\n"
+                narrative += f"- Warning: {r}\n"
             narrative += "\n"
 
         if ioc_strings:
@@ -450,16 +1049,6 @@ def run_analysis(job_id: str):
                 narrative += f"- [{ioc['classification']}] `{ioc['value']}`\n"
 
         # ── Stage 5: Save report ─────────────────────────────────
-        iocs_dict = {
-            "urls": [s["value"] for s in ioc_strings if s["classification"] == "URL"],
-            "ips": [s["value"] for s in ioc_strings if s["classification"] == "IP_ADDRESS"],
-            "domains": [s["value"] for s in ioc_strings if s["classification"] == "DOMAIN"],
-            "emails": [s["value"] for s in ioc_strings if s["classification"] == "EMAIL"],
-            "registry_keys": [s["value"] for s in ioc_strings if s["classification"] == "REGISTRY_KEY"],
-            "file_paths": [s["value"] for s in ioc_strings if s["classification"] == "FILE_PATH"],
-            "crypto_wallets": [s["value"] for s in ioc_strings if s["classification"] == "CRYPTO_WALLET"],
-        }
-
         report = session.query(ThreatReport).filter_by(job_id=job_id).first()
         if report is None:
             report = ThreatReport(job_id=job_id, file_hash_sha256=job.file_hash_sha256)

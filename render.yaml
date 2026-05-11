@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: sentinel-api
+    env: docker
+    rootDir: backend
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: DEBUG
+        value: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sentinel-db
+          property: connectionString
+      - key: STORAGE_BACKEND
+        value: minio
+      - key: MINIO_ENDPOINT
+        sync: false
+      - key: MINIO_ACCESS_KEY
+        sync: false
+      - key: MINIO_SECRET_KEY
+        sync: false
+      - key: MINIO_BUCKET
+        sync: false
+      - key: MINIO_SECURE
+        value: true
+      - key: SECRET_KEY
+        generateValue: true
+      - key: USE_CELERY
+        value: false
+
+databases:
+  - name: sentinel-db

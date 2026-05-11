@@ -1,593 +1,111 @@
-'use client';
+import Image from 'next/image';
+import Link from 'next/link';
 
-import { useState, useCallback, useEffect, useRef } from 'react';
-import axios from 'axios';
+const metrics = [
+  { label: 'Static signals', value: '5K+' },
+  { label: 'Report views', value: '6' },
+  { label: 'Workflow', value: 'Upload to verdict' },
+];
 
-const API_BASE = '/api/v1';
+const useCases = [
+  'SOC triage intake',
+  'Malware research notes',
+  'Incident response evidence',
+  'Detection rule drafting',
+];
 
-// ── Sidebar ─────────────────────────────────────────────────────
-
-function Sidebar({ currentPage, onNavigate }) {
-  const navItems = [
-    { id: 'dashboard', label: 'Command Center', icon: '◉' },
-    { id: 'upload', label: 'Analyze File', icon: '⬆' },
-    { id: 'jobs', label: 'Analysis History', icon: '☰' },
-  ];
-
+export default function LandingPage() {
   return (
-    <aside className="sidebar">
-      <div className="sidebar-header">
-        <div className="sidebar-logo">S</div>
-        <span className="sidebar-brand">SENTINEL</span>
-      </div>
-      <nav className="sidebar-nav">
-        {navItems.map(item => (
-          <div
-            key={item.id}
-            className={`nav-item ${currentPage === item.id ? 'active' : ''}`}
-            onClick={() => onNavigate(item.id)}
-          >
-            <span style={{ fontSize: 18, width: 24, textAlign: 'center' }}>{item.icon}</span>
-            {item.label}
+    <main className="marketing-page">
+      <section className="marketing-hero">
+        <Image
+          src="/sentinel-hero.png"
+          alt="SENTINEL threat intelligence dashboard preview"
+          fill
+          priority
+          sizes="100vw"
+          className="marketing-hero-image"
+        />
+        <div className="marketing-hero-shade" />
+        <nav className="marketing-nav">
+          <Link href="/" className="marketing-brand" aria-label="SENTINEL home">
+            <span className="marketing-brand-mark">S</span>
+            <span>SENTINEL</span>
+          </Link>
+          <div className="marketing-nav-actions">
+            <Link href="/dashboard" className="marketing-nav-link">Dashboard</Link>
+            <Link href="/dashboard" className="btn btn-primary">Open App</Link>
           </div>
-        ))}
-      </nav>
-      <div style={{ padding: '16px 24px', borderTop: '1px solid var(--border-color)', fontSize: 11, color: 'var(--text-muted)' }}>
-        SENTINEL v0.1.0 — Pre-Seed
-      </div>
-    </aside>
-  );
-}
-
-// ── Stat Card ───────────────────────────────────────────────────
-
-function StatCard({ label, value, change, positive }) {
-  return (
-    <div className="stat-card">
-      <div className="stat-label">{label}</div>
-      <div className="stat-value">{value}</div>
-      {change && (
-        <div className={`stat-change ${positive ? 'positive' : 'negative'}`}>
-          {positive ? '↑' : '↓'} {change}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Upload Zone ─────────────────────────────────────────────────
-
-function UploadZone({ onFileSelected }) {
-  const [dragOver, setDragOver] = useState(false);
-  const fileInputRef = useRef(null);
-
-  const handleDrop = useCallback((e) => {
-    e.preventDefault();
-    setDragOver(false);
-    const files = e.dataTransfer.files;
-    if (files.length > 0) onFileSelected(files[0]);
-  }, [onFileSelected]);
-
-  return (
-    <div
-      className={`upload-zone ${dragOver ? 'drag-over' : ''}`}
-      onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-      onDragLeave={() => setDragOver(false)}
-      onDrop={handleDrop}
-      onClick={() => fileInputRef.current?.click()}
-    >
-      <div className="upload-icon" style={{ fontSize: 48, marginBottom: 16 }}>🔬</div>
-      <div className="upload-title">Drop a suspicious file here</div>
-      <div className="upload-subtitle">
-        or click to browse — PE, ELF, scripts, docs, archives up to 500MB
-      </div>
-      <input
-        ref={fileInputRef}
-        type="file"
-        style={{ display: 'none' }}
-        onChange={(e) => e.target.files?.[0] && onFileSelected(e.target.files[0])}
-      />
-    </div>
-  );
-}
-
-// ── Analysis Progress ───────────────────────────────────────────
-
-function AnalysisProgress({ jobId, onComplete }) {
-  const [job, setJob] = useState(null);
-
-  useEffect(() => {
-    if (!jobId) return;
-    const interval = setInterval(async () => {
-      try {
-        const res = await axios.get(`${API_BASE}/analyze/${jobId}`);
-        setJob(res.data);
-        if (res.data.status === 'COMPLETED' || res.data.status === 'FAILED') {
-          clearInterval(interval);
-          if (res.data.status === 'COMPLETED') onComplete(res.data);
-        }
-      } catch (err) {
-        console.error('Poll error:', err);
-      }
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [jobId, onComplete]);
-
-  const statusLabel = {
-    QUEUED: 'Queued for analysis...',
-    INGESTING: 'Ingesting file...',
-    ANALYZING: 'Running static analysis...',
-    CORTEX_REASONING: 'AI reasoning engine processing...',
-    COMPLETED: 'Analysis complete!',
-    FAILED: 'Analysis failed.',
-  };
-
-  return (
-    <div className="card animate-in" style={{ textAlign: 'center', padding: 48 }}>
-      <div style={{ marginBottom: 24 }}>
-        {job?.status === 'COMPLETED' ? (
-          <span style={{ fontSize: 48 }}>✅</span>
-        ) : job?.status === 'FAILED' ? (
-          <span style={{ fontSize: 48 }}>❌</span>
-        ) : (
-          <div className="spinner" style={{ width: 48, height: 48, margin: '0 auto', borderWidth: 3 }} />
-        )}
-      </div>
-      <h3 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>
-        {statusLabel[job?.status] || 'Initializing...'}
-      </h3>
-      <p style={{ color: 'var(--text-secondary)', fontSize: 14, marginBottom: 20 }}>
-        {job?.file_name || 'Processing your file'}
-      </p>
-      <div className="progress-bar" style={{ maxWidth: 400, margin: '0 auto' }}>
-        <div className="progress-fill" style={{ width: `${job?.progress_percent || 0}%` }} />
-      </div>
-      <p style={{ color: 'var(--text-muted)', fontSize: 12, marginTop: 8 }}>
-        {job?.progress_percent || 0}% complete
-      </p>
-      {job?.status === 'COMPLETED' && job?.report_url && (
-        <button
-          className="btn btn-primary"
-          style={{ marginTop: 24 }}
-          onClick={() => onComplete(job)}
-        >
-          View Threat Report →
-        </button>
-      )}
-    </div>
-  );
-}
-
-// ── Status Badge ────────────────────────────────────────────────
-
-function StatusBadge({ status }) {
-  const cls = {
-    QUEUED: 'badge-queued', INGESTING: 'badge-queued',
-    ANALYZING: 'badge-analyzing', CORTEX_REASONING: 'badge-analyzing',
-    COMPLETED: 'badge-completed', FAILED: 'badge-failed',
-  };
-  return <span className={`badge ${cls[status] || 'badge-queued'}`}>{status}</span>;
-}
-
-function VerdictBadge({ verdict }) {
-  const cls = {
-    BENIGN: 'badge-benign', SUSPICIOUS: 'badge-suspicious',
-    MALICIOUS: 'badge-malicious', UNKNOWN: 'badge-queued',
-  };
-  return <span className={`badge ${cls[verdict] || 'badge-queued'}`}>{verdict}</span>;
-}
-
-// ── Report View ─────────────────────────────────────────────────
-
-function ReportView({ reportHash, onBack }) {
-  const [report, setReport] = useState(null);
-  const [activeTab, setActiveTab] = useState('summary');
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    if (!reportHash) return;
-    axios.get(`${API_BASE}/report/${reportHash}`)
-      .then(res => { setReport(res.data); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, [reportHash]);
-
-  if (loading) return <div style={{ textAlign: 'center', padding: 60 }}><div className="spinner" style={{ margin: '0 auto' }} /></div>;
-  if (!report) return <div className="empty-state"><div className="empty-state-title">Report not found</div></div>;
-
-  const severityClass = report.severity_score >= 70 ? 'high' : report.severity_score >= 30 ? 'medium' : 'low';
-
-  return (
-    <div className="animate-in">
-      <button className="btn btn-ghost" onClick={onBack} style={{ marginBottom: 20 }}>← Back</button>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 20, marginBottom: 24 }}>
-        <div className="card" style={{ textAlign: 'center' }}>
-          <div className="stat-label">Severity Score</div>
-          <div className={`severity-score ${severityClass}`}>{report.severity_score}</div>
-          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>/ 100</div>
-        </div>
-        <div className="card" style={{ textAlign: 'center' }}>
-          <div className="stat-label">Verdict</div>
-          <div style={{ marginTop: 12 }}><VerdictBadge verdict={report.verdict} /></div>
-        </div>
-        <div className="card" style={{ textAlign: 'center' }}>
-          <div className="stat-label">File Hash</div>
-          <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: 'var(--text-secondary)', marginTop: 12, wordBreak: 'break-all' }}>
-            {report.file_hash_sha256}
+        </nav>
+        <div className="marketing-hero-content">
+          <p className="marketing-kicker">Autonomous threat intelligence</p>
+          <h1>SENTINEL</h1>
+          <p className="marketing-hero-copy">
+            Upload suspicious files, extract static evidence, and turn noisy malware signals into a living analyst report.
+          </p>
+          <div className="marketing-actions">
+            <Link href="/dashboard" className="btn btn-primary">Analyze a File</Link>
+            <a href="#workflow" className="btn btn-ghost">View Workflow</a>
           </div>
         </div>
-      </div>
+      </section>
 
-      <div className="card">
-        <div className="tabs">
-          {['summary', 'static', 'iocs'].map(tab => (
-            <button key={tab} className={`tab ${activeTab === tab ? 'active' : ''}`} onClick={() => setActiveTab(tab)}>
-              {tab === 'summary' ? '🤖 AI Summary' : tab === 'static' ? '🔍 Static Analysis' : '🎯 IOCs'}
-            </button>
-          ))}
-        </div>
-
-        {activeTab === 'summary' && report.ai_narrative && (
-          <div className="markdown-content">
-            {report.ai_narrative.split('\n').map((line, i) => {
-              if (line.startsWith('## ')) return <h2 key={i}>{line.replace('## ', '')}</h2>;
-              if (line.startsWith('### ')) return <h3 key={i}>{line.replace('### ', '')}</h3>;
-              if (line.startsWith('- ')) return <li key={i} dangerouslySetInnerHTML={{ __html: line.replace('- ', '').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>') }} />;
-              if (line.startsWith('**')) return <p key={i} dangerouslySetInnerHTML={{ __html: line.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>') }} />;
-              if (line.trim()) return <p key={i}>{line}</p>;
-              return null;
-            })}
-          </div>
-        )}
-
-        {activeTab === 'static' && report.static_data && (
-          <div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 20 }}>
-              <div style={{ padding: 16, background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}>
-                <div className="stat-label">Entropy</div>
-                <div className="stat-value" style={{ fontSize: 24 }}>{report.static_data.entropy}</div>
-                <div className="progress-bar" style={{ marginTop: 8 }}>
-                  <div className="progress-fill" style={{ width: `${(report.static_data.entropy / 8) * 100}%` }} />
-                </div>
-                {report.static_data.high_entropy && <div style={{ color: 'var(--color-warning)', fontSize: 12, marginTop: 4 }}>⚠ High entropy — possibly packed</div>}
-              </div>
-              <div style={{ padding: 16, background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}>
-                <div className="stat-label">Strings Found</div>
-                <div className="stat-value" style={{ fontSize: 24 }}>{report.static_data.strings_count}</div>
-              </div>
-            </div>
-            {report.static_data.pe_headers && (
-              <div style={{ marginBottom: 24 }}>
-                <div className="card-title" style={{ marginBottom: 12 }}>PE Header Information</div>
-                <table className="data-table">
-                  <tbody>
-                    {Object.entries(report.static_data.pe_headers).map(([key, val]) => (
-                      <tr key={key}>
-                        <td style={{ fontWeight: 600, color: 'var(--text-accent)', width: '40%' }}>{key}</td>
-                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>{String(val)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            {report.static_data.pe_sections?.length > 0 && (
-              <div style={{ marginBottom: 24 }}>
-                <div className="card-title" style={{ marginBottom: 12 }}>PE Sections</div>
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>Name</th>
-                      <th>Virtual Size</th>
-                      <th>Raw Size</th>
-                      <th>Entropy</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {report.static_data.pe_sections.map((section, i) => (
-                      <tr key={`${section.name}-${i}`}>
-                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>{section.name}</td>
-                        <td>{section.virtual_size}</td>
-                        <td>{section.raw_size}</td>
-                        <td style={{ color: section.high_entropy ? 'var(--color-warning)' : 'var(--text-secondary)' }}>
-                          {section.entropy}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            {report.static_data.pe_imports?.length > 0 && (
-              <div style={{ marginBottom: 24 }}>
-                <div className="card-title" style={{ marginBottom: 12 }}>Imported APIs</div>
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>DLL</th>
-                      <th>Functions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {report.static_data.pe_imports.slice(0, 20).map((item, i) => (
-                      <tr key={`${item.dll}-${i}`}>
-                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>{item.dll}</td>
-                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>
-                          {(item.functions || []).slice(0, 12).join(', ')}
-                          {(item.functions || []).length > 12 ? ' ...' : ''}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            {report.static_data.strings_sample?.length > 0 && (
-              <div>
-                <div className="card-title" style={{ marginBottom: 12 }}>Extracted Strings</div>
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>Type</th>
-                      <th>Offset</th>
-                      <th>Value</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {report.static_data.strings_sample.slice(0, 25).map((item, i) => (
-                      <tr key={`${item.offset}-${i}`}>
-                        <td><span className="badge badge-queued">{item.classification}</span></td>
-                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>{item.offset}</td>
-                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, wordBreak: 'break-all' }}>{item.value}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-        )}
-
-        {activeTab === 'iocs' && report.iocs && (
-          <div>
-            {Object.entries(report.iocs).filter(([, v]) => v.length > 0).map(([category, values]) => (
-              <div key={category} style={{ marginBottom: 20 }}>
-                <h3 style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-accent)', marginBottom: 8, textTransform: 'uppercase' }}>
-                  {category.replace('_', ' ')} ({values.length})
-                </h3>
-                {values.map((val, i) => (
-                  <div key={i} style={{
-                    padding: '8px 12px', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-sm)',
-                    marginBottom: 4, fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: 'var(--color-danger)'
-                  }}>
-                    {val}
-                  </div>
-                ))}
+      <section className="marketing-band">
+        <div className="marketing-inner">
+          <div className="marketing-metrics" aria-label="SENTINEL product signals">
+            {metrics.map((item) => (
+              <div className="marketing-metric" key={item.label}>
+                <span>{item.value}</span>
+                <p>{item.label}</p>
               </div>
             ))}
-            {Object.values(report.iocs).every(v => v.length === 0) && (
-              <div className="empty-state"><div className="empty-state-title">No IOCs detected</div></div>
-            )}
           </div>
-        )}
-      </div>
-    </div>
-  );
-}
+        </div>
+      </section>
 
-// ── Main Page ───────────────────────────────────────────────────
-
-export default function Home() {
-  const [page, setPage] = useState('dashboard');
-  const [uploading, setUploading] = useState(false);
-  const [activeJobId, setActiveJobId] = useState(null);
-  const [reportHash, setReportHash] = useState(null);
-  const [jobs, setJobs] = useState([]);
-  const [stats, setStats] = useState({ total: 0, completed: 0, malicious: 0, queued: 0 });
-
-  // Load jobs
-  const loadJobs = useCallback(async () => {
-    try {
-      const res = await axios.get(`${API_BASE}/jobs?per_page=50`);
-      setJobs(res.data.jobs || []);
-      const all = res.data.jobs || [];
-      setStats({
-        total: res.data.total,
-        completed: all.filter(j => j.status === 'COMPLETED').length,
-        malicious: 0,
-        queued: all.filter(j => j.status === 'QUEUED' || j.status === 'ANALYZING').length,
-      });
-    } catch (err) {
-      // API might not be up yet
-    }
-  }, []);
-
-  useEffect(() => {
-    loadJobs();
-    const interval = setInterval(loadJobs, 10000);
-    return () => clearInterval(interval);
-  }, [loadJobs]);
-
-  // Handle file upload
-  const handleFileUpload = async (file) => {
-    setUploading(true);
-    try {
-      const formData = new FormData();
-      formData.append('file', file);
-      const res = await axios.post(`${API_BASE}/analyze`, formData);
-      setActiveJobId(res.data.job_id);
-      setPage('progress');
-    } catch (err) {
-      alert(err.response?.data?.detail || 'Upload failed');
-    }
-    setUploading(false);
-  };
-
-  // Handle job completion
-  const handleComplete = (job) => {
-    if (job.report_url) {
-      const hash = job.report_url.split('/').pop();
-      setReportHash(hash);
-      setPage('report');
-    }
-    loadJobs();
-  };
-
-  // Format file size
-  const formatSize = (bytes) => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / 1048576).toFixed(1)} MB`;
-  };
-
-  // Format date
-  const formatDate = (d) => new Date(d).toLocaleString();
-
-  return (
-    <div className="app-layout">
-      <Sidebar currentPage={page} onNavigate={(p) => { setPage(p); setReportHash(null); setActiveJobId(null); }} />
-
-      <main className="main-content">
-        {/* ── Dashboard ──────────────────────────────────── */}
-        {page === 'dashboard' && (
-          <div className="animate-in">
-            <div className="page-header">
-              <h1 className="page-title">Command Center</h1>
-              <p className="page-subtitle">Real-time threat intelligence overview</p>
-            </div>
-            <div className="stats-grid">
-              <StatCard label="Total Analyses" value={stats.total} />
-              <StatCard label="Completed" value={stats.completed} change="Ready" positive />
-              <StatCard label="In Queue" value={stats.queued} />
-            </div>
-            <div className="card">
-              <div className="card-header">
-                <span className="card-title">Recent Analyses</span>
-                <button className="btn btn-primary" onClick={() => setPage('upload')}>+ New Analysis</button>
-              </div>
-              {jobs.length > 0 ? (
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>File Name</th>
-                      <th>Size</th>
-                      <th>Status</th>
-                      <th>Submitted</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {jobs.slice(0, 10).map(job => (
-                      <tr key={job.job_id} onClick={() => {
-                        if (job.status === 'COMPLETED' && job.report_url) {
-                          setReportHash(job.report_url.split('/').pop());
-                          setPage('report');
-                        }
-                      }}>
-                        <td style={{ fontWeight: 500, color: 'var(--text-primary)' }}>{job.file_name}</td>
-                        <td>{formatSize(job.file_size_bytes)}</td>
-                        <td><StatusBadge status={job.status} /></td>
-                        <td>{formatDate(job.created_at)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : (
-                <div className="empty-state">
-                  <div className="empty-state-title">No analyses yet</div>
-                  <p style={{ color: 'var(--text-muted)', marginBottom: 20 }}>Upload your first suspicious file to get started</p>
-                  <button className="btn btn-primary" onClick={() => setPage('upload')}>Analyze a File</button>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ── Upload ─────────────────────────────────────── */}
-        {page === 'upload' && (
-          <div className="animate-in">
-            <div className="page-header">
-              <h1 className="page-title">Analyze File</h1>
-              <p className="page-subtitle">Upload a suspicious file for autonomous threat analysis</p>
-            </div>
-            {uploading ? (
-              <div className="card" style={{ textAlign: 'center', padding: 48 }}>
-                <div className="spinner" style={{ width: 40, height: 40, margin: '0 auto 16px' }} />
-                <p style={{ color: 'var(--text-secondary)' }}>Uploading and hashing...</p>
-              </div>
-            ) : (
-              <UploadZone onFileSelected={handleFileUpload} />
-            )}
-          </div>
-        )}
-
-        {/* ── Progress ───────────────────────────────────── */}
-        {page === 'progress' && activeJobId && (
-          <div className="animate-in">
-            <div className="page-header">
-              <h1 className="page-title">Analysis in Progress</h1>
-              <p className="page-subtitle">SENTINEL is examining your file</p>
-            </div>
-            <AnalysisProgress jobId={activeJobId} onComplete={handleComplete} />
-          </div>
-        )}
-
-        {/* ── Report ─────────────────────────────────────── */}
-        {page === 'report' && reportHash && (
+      <section className="marketing-section" id="workflow">
+        <div className="marketing-inner marketing-two-column">
           <div>
-            <div className="page-header">
-              <h1 className="page-title">Threat Report</h1>
-              <p className="page-subtitle">Detailed analysis findings</p>
-            </div>
-            <ReportView reportHash={reportHash} onBack={() => setPage('dashboard')} />
+            <p className="marketing-kicker">From sample to report</p>
+            <h2>Built for fast analyst judgment.</h2>
+            <p>
+              SENTINEL keeps the workflow direct: ingest a file, compute hashes, extract strings and IOCs,
+              map suspicious behavior, then preserve the result as a searchable report.
+            </p>
           </div>
-        )}
+          <div className="marketing-workflow">
+            <div>
+              <span>01</span>
+              <strong>Ingest</strong>
+              <p>Upload a sample and capture immutable hashes.</p>
+            </div>
+            <div>
+              <span>02</span>
+              <strong>Reason</strong>
+              <p>Score static signals with benign installer context.</p>
+            </div>
+            <div>
+              <span>03</span>
+              <strong>Act</strong>
+              <p>Review IOCs, behavior matches, and draft detections.</p>
+            </div>
+          </div>
+        </div>
+      </section>
 
-        {/* ── Job History ────────────────────────────────── */}
-        {page === 'jobs' && (
-          <div className="animate-in">
-            <div className="page-header">
-              <h1 className="page-title">Analysis History</h1>
-              <p className="page-subtitle">All submitted files and their results</p>
-            </div>
-            <div className="card">
-              {jobs.length > 0 ? (
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>File Name</th>
-                      <th>SHA-256</th>
-                      <th>Size</th>
-                      <th>Status</th>
-                      <th>Submitted</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {jobs.map(job => (
-                      <tr key={job.job_id} onClick={() => {
-                        if (job.status === 'COMPLETED' && job.report_url) {
-                          setReportHash(job.report_url.split('/').pop());
-                          setPage('report');
-                        }
-                      }}>
-                        <td style={{ fontWeight: 500, color: 'var(--text-primary)' }}>{job.file_name}</td>
-                        <td style={{ fontFamily: "'JetBrains Mono'", fontSize: 11 }}>{job.file_hash_sha256?.slice(0, 16)}...</td>
-                        <td>{formatSize(job.file_size_bytes)}</td>
-                        <td><StatusBadge status={job.status} /></td>
-                        <td>{formatDate(job.created_at)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : (
-                <div className="empty-state">
-                  <div className="empty-state-title">No analyses yet</div>
-                  <button className="btn btn-primary" onClick={() => setPage('upload')} style={{ marginTop: 16 }}>Analyze a File</button>
-                </div>
-              )}
-            </div>
+      <section className="marketing-section marketing-section-muted">
+        <div className="marketing-inner">
+          <div className="marketing-section-header">
+            <p className="marketing-kicker">Use cases</p>
+            <h2>For teams that need signal without ceremony.</h2>
           </div>
-        )}
-      </main>
-    </div>
+          <div className="marketing-use-cases">
+            {useCases.map((item) => (
+              <div className="marketing-use-case" key={item}>{item}</div>
+            ))}
+          </div>
+        </div>
+      </section>
+    </main>
   );
 }
