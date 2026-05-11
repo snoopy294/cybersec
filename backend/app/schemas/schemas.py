@@ -5,7 +5,7 @@ from datetime import datetime
 from uuid import UUID
 from typing import Optional, List, Any
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 
 from app.models.models import TenantTier, UserRole, JobStatus, Verdict
 
@@ -13,13 +13,24 @@ from app.models.models import TenantTier, UserRole, JobStatus, Verdict
 # ── Auth Schemas ─────────────────────────────────────────────────
 
 class UserRegister(BaseModel):
-    email: str = Field(..., description="User email address")
-    password: str = Field(..., min_length=8, description="Password (min 8 chars)")
+    email: str = Field(
+        ...,
+        min_length=3,
+        max_length=320,
+        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+        description="User email address",
+    )
+    password: str = Field(..., min_length=12, description="Password (min 12 chars)")
     tenant_name: str = Field(..., min_length=1, description="Organization name")
 
 
 class UserLogin(BaseModel):
-    email: str
+    email: str = Field(
+        ...,
+        min_length=3,
+        max_length=320,
+        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+    )
     password: str
 
 

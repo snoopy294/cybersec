@@ -50,6 +50,14 @@ DATABASE_URL=<render-postgres-connection-string>
 SECRET_KEY=<generated-secret>
 STORAGE_BACKEND=minio
 USE_CELERY=false
+MAX_FILE_SIZE_MB=100
+UPLOAD_RATE_LIMIT_PER_MINUTE=5
+AUTH_RATE_LIMIT_PER_MINUTE=10
+MAX_ACTIVE_JOBS_PER_TENANT=3
+MAX_DAILY_UPLOAD_MB_PER_TENANT=1024
+RETENTION_DAYS=30
+RETENTION_MAX_JOBS_PER_TENANT=250
+EXPOSE_API_DOCS=false
 ```
 
 Render commonly provides `DATABASE_URL` as `postgresql://...`. The backend normalizes that value for async SQLAlchemy and derives the sync URL used by the analysis worker.
@@ -157,12 +165,18 @@ Upload smoke test:
 - Confirm report metadata still loads.
 - Confirm the uploaded object exists in the R2 bucket.
 
-## Known MVP Limitations
+## Current MVP Safety Controls
 
 - Basic dashboard auth and tenant-scoped jobs/reports are in place.
-- There is no rate limiting or invite-only signup gate yet.
+- Signup requires stronger passwords, auth endpoints and upload endpoints are rate limited, and uploads are capped by active job count plus daily tenant quota.
+- Terminal jobs are cleaned up by retention age and maximum tenant history; unreferenced stored files are removed with those records.
+- Hosted startup fails fast when `DEBUG=false` is paired with the default secret, wildcard CORS, or local file storage.
+
+## Known MVP Limitations
+
+- There is no invite-only signup gate yet.
 - Background-thread analysis is acceptable for the MVP but not ideal for long-running production jobs.
-- Malware sample handling still needs a retention policy, stricter access controls, and operational safety rules before public launch.
+- Malware sample handling still needs isolated execution infrastructure and operational safety rules before public launch.
 - The Cloudflare R2 bucket should remain private; do not enable public object access for uploaded samples.
 - The MVP should be demoed to trusted users until auth and abuse controls are added.
 
@@ -170,7 +184,7 @@ Upload smoke test:
 
 After the MVP deployment is live, prioritize:
 
-1. Rate limiting and abuse controls for public signup/upload.
-2. Real app routes for `/analyze`, `/reports`, `/reports/[hash]`, and `/settings`.
-3. Upload retention controls and sample deletion.
+1. Invite-only signup or admin-managed workspace invites.
+2. Redis-backed distributed rate limiting for multi-instance deployments.
+3. Isolated sandbox execution for untrusted samples.
 4. Optional Redis/Celery worker split if analysis runtime exceeds Render web-service expectations.

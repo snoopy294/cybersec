@@ -68,12 +68,36 @@ def upload_to_local(
     return f"{tenant_id}/{sha256_hash}/{safe_name}"
 
 
+def _safe_local_path(object_path: str) -> str:
+    """Resolve an object path and ensure it stays inside STORAGE_DIR."""
+    storage_root = os.path.realpath(settings.STORAGE_DIR)
+    full_path = os.path.realpath(os.path.join(storage_root, object_path))
+    if full_path != storage_root and not full_path.startswith(storage_root + os.sep):
+        raise StorageOperationError("Refusing to access storage path outside STORAGE_DIR")
+    return full_path
+
+
 def download_from_local(object_path: str) -> bytes:
     """Read a file from local filesystem."""
-    # Normalize separators: object_path uses forward slashes but Windows needs backslashes
-    full_path = os.path.normpath(os.path.join(settings.STORAGE_DIR, object_path))
+    full_path = _safe_local_path(object_path)
     with open(full_path, "rb") as f:
         return f.read()
+
+
+def delete_from_local(object_path: str) -> None:
+    """Delete a local stored file and clean up empty parent directories."""
+    full_path = _safe_local_path(object_path)
+    if os.path.isfile(full_path):
+        os.remove(full_path)
+
+    storage_root = os.path.realpath(settings.STORAGE_DIR)
+    parent = os.path.dirname(full_path)
+    while parent.startswith(storage_root) and parent != storage_root:
+        try:
+            os.rmdir(parent)
+        except OSError:
+            break
+        parent = os.path.dirname(parent)
 
 
 # ── Unified Interface ────────────────────────────────────────────
@@ -96,6 +120,13 @@ def download_file(object_path: str) -> bytes:
     if settings.STORAGE_BACKEND == "minio":
         return _download_from_minio(object_path)
     return download_from_local(object_path)
+
+
+def delete_stored_file(object_path: str) -> None:
+    """Delete a stored file from the configured backend."""
+    if settings.STORAGE_BACKEND == "minio":
+        return _delete_from_minio(object_path)
+    return delete_from_local(object_path)
 
 
 def validate_storage_configuration() -> None:
@@ -182,6 +213,16 @@ def _download_from_minio(object_path):
     finally:
         response.close()
         response.release_conn()
+
+
+def _delete_from_minio(object_path):
+    """Delete an object from MinIO/S3-compatible storage."""
+    validate_storage_configuration()
+    client = _minio_client()
+    try:
+        client.remove_object(settings.MINIO_BUCKET, object_path)
+    except Exception as exc:
+        raise StorageOperationError(f"Failed to delete object '{object_path}': {exc}") from exc
 
 
 def _minio_client():

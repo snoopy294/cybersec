@@ -9,11 +9,11 @@ Implements the core REST API contracts defined in the architecture specification
   - POST /api/v1/auth/login    — Login and get JWT
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 from typing import Optional
 
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Body, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc, text
@@ -38,7 +38,14 @@ from app.services.file_service import (
     storage_health_status,
     upload_file as store_file,
 )
+from app.services.retention_service import enforce_tenant_retention
 from app.services.auth_service import hash_password, verify_password, create_access_token, decode_access_token
+from app.services.security_service import (
+    InMemoryRateLimiter,
+    RateLimitExceeded,
+    client_ip_from_request,
+    validate_password_strength,
+)
 from app.services.detection_service import (
     DETECTION_STRICTNESS_LEVELS,
     DETECTION_TARGETS,
@@ -48,6 +55,7 @@ from app.services.graph_service import build_relationship_graph
 
 settings = get_settings()
 bearer_scheme = HTTPBearer(auto_error=False)
+rate_limiter = InMemoryRateLimiter()
 
 router = APIRouter(prefix="/api/v1", tags=["SENTINEL API"])
 auth_router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
@@ -61,6 +69,100 @@ def _latest_report_query(file_hash: str):
         .order_by(desc(ThreatReport.created_at))
         .limit(1)
     )
+
+
+def _raise_rate_limit(exc: RateLimitExceeded):
+    raise HTTPException(
+        status_code=429,
+        detail="Too many requests. Try again shortly.",
+        headers={"Retry-After": str(exc.retry_after_seconds)},
+    ) from exc
+
+
+def _auth_rate_limit(request: Request, action: str):
+    key = f"auth:{action}:{client_ip_from_request(request)}"
+    try:
+        rate_limiter.check(
+            key,
+            settings.AUTH_RATE_LIMIT_PER_MINUTE,
+            settings.RATE_LIMIT_WINDOW_SECONDS,
+        )
+    except RateLimitExceeded as exc:
+        _raise_rate_limit(exc)
+
+
+def _upload_rate_limit(user: User):
+    key = f"upload:{user.tenant_id}:{user.id}"
+    try:
+        rate_limiter.check(
+            key,
+            settings.UPLOAD_RATE_LIMIT_PER_MINUTE,
+            settings.RATE_LIMIT_WINDOW_SECONDS,
+        )
+    except RateLimitExceeded as exc:
+        _raise_rate_limit(exc)
+
+
+async def _read_limited_upload(file: UploadFile) -> bytes:
+    max_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
+    chunks = []
+    total = 0
+
+    while True:
+        chunk = await file.read(settings.UPLOAD_READ_CHUNK_SIZE_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File exceeds maximum size of {settings.MAX_FILE_SIZE_MB}MB",
+            )
+        chunks.append(chunk)
+
+    if total == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    return b"".join(chunks)
+
+
+async def _enforce_upload_quotas(db: AsyncSession, tenant_id: UUID, incoming_size: int):
+    active_statuses = (
+        JobStatus.INGESTING.value,
+        JobStatus.QUEUED.value,
+        JobStatus.ANALYZING.value,
+        JobStatus.CORTEX_REASONING.value,
+    )
+    active_result = await db.execute(
+        select(func.count()).select_from(AnalysisJob).where(
+            AnalysisJob.tenant_id == tenant_id,
+            AnalysisJob.status.in_(active_statuses),
+        )
+    )
+    active_count = active_result.scalar() or 0
+    if active_count >= settings.MAX_ACTIVE_JOBS_PER_TENANT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Upload queue limit reached ({settings.MAX_ACTIVE_JOBS_PER_TENANT} active jobs)",
+        )
+
+    if settings.MAX_DAILY_UPLOAD_MB_PER_TENANT <= 0:
+        return
+
+    window_start = datetime.now(timezone.utc) - timedelta(days=1)
+    usage_result = await db.execute(
+        select(func.coalesce(func.sum(AnalysisJob.file_size_bytes), 0)).where(
+            AnalysisJob.tenant_id == tenant_id,
+            AnalysisJob.created_at >= window_start,
+        )
+    )
+    used_bytes = usage_result.scalar() or 0
+    max_daily_bytes = settings.MAX_DAILY_UPLOAD_MB_PER_TENANT * 1024 * 1024
+    if used_bytes + incoming_size > max_daily_bytes:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily upload quota exceeded ({settings.MAX_DAILY_UPLOAD_MB_PER_TENANT}MB)",
+        )
 
 
 async def get_current_user(
@@ -126,10 +228,18 @@ async def health_check(db: AsyncSession = Depends(get_db)):
 # ── Auth ─────────────────────────────────────────────────────────
 
 @auth_router.post("/register", response_model=TokenResponse, status_code=201)
-async def register(data: UserRegister, db: AsyncSession = Depends(get_db)):
+async def register(request: Request, data: UserRegister, db: AsyncSession = Depends(get_db)):
     """Register a new user and create their tenant."""
+    _auth_rate_limit(request, "register")
+    try:
+        validate_password_strength(data.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    email = str(data.email).lower()
+
     # Check if email already exists
-    existing = await db.execute(select(User).where(User.email == data.email))
+    existing = await db.execute(select(User).where(User.email == email))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Email already registered")
 
@@ -141,7 +251,7 @@ async def register(data: UserRegister, db: AsyncSession = Depends(get_db)):
     # Create user
     user = User(
         tenant_id=tenant.id,
-        email=data.email,
+        email=email,
         password_hash=hash_password(data.password),
     )
     db.add(user)
@@ -157,9 +267,10 @@ async def register(data: UserRegister, db: AsyncSession = Depends(get_db)):
 
 
 @auth_router.post("/login", response_model=TokenResponse)
-async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
+async def login(request: Request, data: UserLogin, db: AsyncSession = Depends(get_db)):
     """Authenticate and return a JWT token."""
-    result = await db.execute(select(User).where(User.email == data.email))
+    _auth_rate_limit(request, "login")
+    result = await db.execute(select(User).where(User.email == str(data.email).lower()))
     user = result.scalar_one_or_none()
 
     if not user or not user.is_active or not verify_password(data.password, user.password_hash):
@@ -210,20 +321,13 @@ async def upload_file(
     The file is stored in MinIO, hashed, and a background analysis
     job is dispatched to the Celery worker pipeline.
     """
-    # Read file bytes
-    file_bytes = await file.read()
+    _upload_rate_limit(current_user)
+    await enforce_tenant_retention(db, current_user.tenant_id)
+
+    # Read file bytes in bounded chunks so oversize uploads fail early.
+    file_bytes = await _read_limited_upload(file)
     file_size = len(file_bytes)
-
-    # Enforce size limit
-    max_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
-    if file_size > max_bytes:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File exceeds maximum size of {settings.MAX_FILE_SIZE_MB}MB",
-        )
-
-    if file_size == 0:
-        raise HTTPException(status_code=400, detail="Empty file")
+    await _enforce_upload_quotas(db, current_user.tenant_id, file_size)
 
     # Compute hashes
     hashes = compute_file_hashes(file_bytes)

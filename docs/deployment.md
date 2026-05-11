@@ -27,11 +27,20 @@ MINIO_BUCKET=<r2-bucket-name>
 MINIO_SECURE=true
 SECRET_KEY=<generated secret>
 USE_CELERY=false
+MAX_FILE_SIZE_MB=100
+UPLOAD_RATE_LIMIT_PER_MINUTE=5
+MAX_ACTIVE_JOBS_PER_TENANT=3
+MAX_DAILY_UPLOAD_MB_PER_TENANT=1024
+RETENTION_DAYS=30
+RETENTION_MAX_JOBS_PER_TENANT=250
+EXPOSE_API_DOCS=false
 ```
 
 Render commonly provides `DATABASE_URL` as `postgresql://...`; the backend normalizes it to the async URL used by SQLAlchemy and derives the sync URL used by the analysis worker.
 
 Cloudflare R2 is the MVP object-storage target. Keep the R2 bucket private and set `MINIO_ENDPOINT` to the host-only account endpoint without `https://`.
+
+When `DEBUG=false`, the backend refuses to start with the default development secret, wildcard CORS origins, or local filesystem sample storage. This is intentional; uploaded samples must stay in private object storage for hosted environments.
 
 ## Frontend on Vercel
 

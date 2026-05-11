@@ -46,7 +46,16 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
     # ── Upload Limits ────────────────────────────────────────────
-    MAX_FILE_SIZE_MB: int = 500
+    MAX_FILE_SIZE_MB: int = 100
+    UPLOAD_READ_CHUNK_SIZE_BYTES: int = 1024 * 1024
+    UPLOAD_RATE_LIMIT_PER_MINUTE: int = 5
+    AUTH_RATE_LIMIT_PER_MINUTE: int = 10
+    RATE_LIMIT_WINDOW_SECONDS: int = 60
+    MAX_ACTIVE_JOBS_PER_TENANT: int = 3
+    MAX_DAILY_UPLOAD_MB_PER_TENANT: int = 1024
+    RETENTION_DAYS: int = 30
+    RETENTION_MAX_JOBS_PER_TENANT: int = 250
+    EXPOSE_API_DOCS: bool = True
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
