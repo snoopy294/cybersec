@@ -178,7 +178,8 @@ async def upload_file(
         minio_object_path=object_path,
     )
     db.add(job)
-    await db.flush()
+    await db.commit()
+    await db.refresh(job)
 
     # Dispatch analysis (background thread or Celery)
     from app.worker import dispatch_analysis

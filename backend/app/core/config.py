@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = True
 
+    # ── Deployment ────────────────────────────────────────────────
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    ALLOWED_ORIGINS: str = "*"  # Comma-separated list, e.g. "https://sentinel.example.com,https://www.sentinel.example.com"
+
     # ── Database (SQLite by default — no install required) ───────
     DATABASE_URL: str = "sqlite+aiosqlite:///./sentinel.db"
     DATABASE_URL_SYNC: str = "sqlite:///./sentinel.db"
@@ -33,7 +38,7 @@ class Settings(BaseSettings):
     USE_CELERY: bool = False  # Set True if Redis + Celery are available
 
     # ── Auth ─────────────────────────────────────────────────────
-    SECRET_KEY: str = "sentinel-dev-secret-change-in-production-2026"
+    SECRET_KEY: str = "sentinel-dev-secret-change-in-production-2026"  # ⚠ CHANGE THIS in .env for production!
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 

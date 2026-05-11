@@ -243,7 +243,7 @@ function ReportView({ reportHash, onBack }) {
         {activeTab === 'static' && report.static_data && (
           <div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 20 }}>
-              <div className="card">
+              <div style={{ padding: 16, background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}>
                 <div className="stat-label">Entropy</div>
                 <div className="stat-value" style={{ fontSize: 24 }}>{report.static_data.entropy}</div>
                 <div className="progress-bar" style={{ marginTop: 8 }}>
@@ -251,13 +251,13 @@ function ReportView({ reportHash, onBack }) {
                 </div>
                 {report.static_data.high_entropy && <div style={{ color: 'var(--color-warning)', fontSize: 12, marginTop: 4 }}>⚠ High entropy — possibly packed</div>}
               </div>
-              <div className="card">
+              <div style={{ padding: 16, background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}>
                 <div className="stat-label">Strings Found</div>
                 <div className="stat-value" style={{ fontSize: 24 }}>{report.static_data.strings_count}</div>
               </div>
             </div>
             {report.static_data.pe_headers && (
-              <div className="card" style={{ marginBottom: 16 }}>
+              <div style={{ marginBottom: 24 }}>
                 <div className="card-title" style={{ marginBottom: 12 }}>PE Header Information</div>
                 <table className="data-table">
                   <tbody>
@@ -265,6 +265,80 @@ function ReportView({ reportHash, onBack }) {
                       <tr key={key}>
                         <td style={{ fontWeight: 600, color: 'var(--text-accent)', width: '40%' }}>{key}</td>
                         <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>{String(val)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {report.static_data.pe_sections?.length > 0 && (
+              <div style={{ marginBottom: 24 }}>
+                <div className="card-title" style={{ marginBottom: 12 }}>PE Sections</div>
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Virtual Size</th>
+                      <th>Raw Size</th>
+                      <th>Entropy</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.static_data.pe_sections.map((section, i) => (
+                      <tr key={`${section.name}-${i}`}>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>{section.name}</td>
+                        <td>{section.virtual_size}</td>
+                        <td>{section.raw_size}</td>
+                        <td style={{ color: section.high_entropy ? 'var(--color-warning)' : 'var(--text-secondary)' }}>
+                          {section.entropy}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {report.static_data.pe_imports?.length > 0 && (
+              <div style={{ marginBottom: 24 }}>
+                <div className="card-title" style={{ marginBottom: 12 }}>Imported APIs</div>
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>DLL</th>
+                      <th>Functions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.static_data.pe_imports.slice(0, 20).map((item, i) => (
+                      <tr key={`${item.dll}-${i}`}>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>{item.dll}</td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>
+                          {(item.functions || []).slice(0, 12).join(', ')}
+                          {(item.functions || []).length > 12 ? ' ...' : ''}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {report.static_data.strings_sample?.length > 0 && (
+              <div>
+                <div className="card-title" style={{ marginBottom: 12 }}>Extracted Strings</div>
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Type</th>
+                      <th>Offset</th>
+                      <th>Value</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.static_data.strings_sample.slice(0, 25).map((item, i) => (
+                      <tr key={`${item.offset}-${i}`}>
+                        <td><span className="badge badge-queued">{item.classification}</span></td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>{item.offset}</td>
+                        <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, wordBreak: 'break-all' }}>{item.value}</td>
                       </tr>
                     ))}
                   </tbody>

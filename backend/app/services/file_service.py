@@ -37,20 +37,21 @@ def upload_to_local(
 ) -> str:
     """Save a file to local filesystem and return the relative path."""
     _ensure_storage_dir()
-    dir_path = os.path.join(settings.STORAGE_DIR, tenant_id, sha256_hash)
+    dir_path = os.path.normpath(os.path.join(settings.STORAGE_DIR, tenant_id, sha256_hash))
     os.makedirs(dir_path, exist_ok=True)
 
     file_path = os.path.join(dir_path, file_name)
     with open(file_path, "wb") as f:
         f.write(file_bytes)
 
-    # Return relative path for DB storage
+    # Return relative path for DB storage (forward slashes for portability)
     return f"{tenant_id}/{sha256_hash}/{file_name}"
 
 
 def download_from_local(object_path: str) -> bytes:
     """Read a file from local filesystem."""
-    full_path = os.path.join(settings.STORAGE_DIR, object_path)
+    # Normalize separators: object_path uses forward slashes but Windows needs backslashes
+    full_path = os.path.normpath(os.path.join(settings.STORAGE_DIR, object_path))
     with open(full_path, "rb") as f:
         return f.read()
 
