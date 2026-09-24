@@ -1,6 +1,4 @@
-# 🛡️ SENTINEL — The Autonomous Threat Intelligence Platform
-
-> *"We don't scan files. We understand them."*
+# Autonomous Threat Intelligence Platform
 
 ## Quick Start
 
@@ -60,7 +58,3 @@ cyber/
 │   └── backlog.md        # Epics, stories & sprints
 └── docker-compose.yml    # Full local dev stack
 ```
-
-## License
-
-Proprietary — SENTINEL Founding Team © 2026
