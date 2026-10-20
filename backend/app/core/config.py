@@ -2,9 +2,17 @@
 
 from functools import lru_cache
 import os
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+
+def _rewrite_query(url: str, rename: dict[str, str], drop: tuple[str, ...] = ()) -> str:
+    """Rename or drop query parameters on a database URL."""
+    parts = urlsplit(url)
+    params = [(rename.get(key, key), val) for key, val in parse_qsl(parts.query) if key not in drop]
+    return urlunsplit(parts._replace(query=urlencode(params)))
 
 
 class Settings(BaseSettings):
@@ -44,6 +52,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "sentinel-dev-secret-change-in-production-2026"  # ⚠ CHANGE THIS in .env for production!
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    ALLOW_REGISTRATION: bool = True  # Set False on hosted deploys once your accounts exist
 
     # ── Upload Limits ────────────────────────────────────────────
     MAX_FILE_SIZE_MB: int = 100
@@ -60,8 +69,10 @@ class Settings(BaseSettings):
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
     def normalize_async_database_url(cls, value):
-        if isinstance(value, str) and value.startswith("postgresql://"):
-            return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+        if isinstance(value, str) and value.startswith(("postgres://", "postgresql://")):
+            value = "postgresql+asyncpg://" + value.split("://", 1)[1]
+            # Hosted providers (e.g. Neon) append libpq params that asyncpg rejects.
+            return _rewrite_query(value, {"sslmode": "ssl"}, drop=("channel_binding",))
         return value
 
     @model_validator(mode="after")
@@ -70,7 +81,10 @@ class Settings(BaseSettings):
             if self.DATABASE_URL.startswith("sqlite+aiosqlite://"):
                 self.DATABASE_URL_SYNC = self.DATABASE_URL.replace("sqlite+aiosqlite://", "sqlite://", 1)
             elif self.DATABASE_URL.startswith("postgresql+asyncpg://"):
-                self.DATABASE_URL_SYNC = self.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
+                self.DATABASE_URL_SYNC = _rewrite_query(
+                    self.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1),
+                    {"ssl": "sslmode"},
+                )
             else:
                 self.DATABASE_URL_SYNC = self.DATABASE_URL
         return self

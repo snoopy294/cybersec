@@ -6,9 +6,8 @@ const nextConfig = {
   output: process.env.NODE_ENV === 'production' ? 'standalone' : undefined,
 
   async rewrites() {
-    // In production, the reverse proxy (Nginx/Caddy) handles routing.
-    // In development, proxy API calls to the local backend.
-    const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+    // Proxy API calls to the backend (Render in production, localhost in development).
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:8000';
     return [
       {
         source: '/api/:path*',

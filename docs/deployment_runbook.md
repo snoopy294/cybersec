@@ -9,7 +9,7 @@ Deploy SENTINEL as a hosted MVP:
 - Public landing page on Vercel at `/`
 - Protected dashboard on Vercel at `/dashboard`
 - FastAPI backend on Render
-- Postgres on Render
+- Postgres on Neon (free tier)
 - Uploaded samples stored in a private Cloudflare R2 bucket
 - Vercel `/api/v1/*` requests rewritten to the Render backend
 
@@ -18,7 +18,7 @@ Deploy SENTINEL as a hosted MVP:
 - Latest `main` is pushed to GitHub.
 - Cloudflare R2 bucket exists and is private.
 - R2 access keys can read and write objects in the bucket.
-- Render Postgres database exists.
+- Neon Postgres project exists (free tier; Render's free Postgres expires after 30 days).
 - Render backend service is connected to this GitHub repo.
 - Vercel frontend project uses `frontend` as the project root.
 - No secrets are committed to the repo.
@@ -53,7 +53,7 @@ Set these Render environment variables:
 ```env
 DEBUG=false
 SECRET_KEY=<long-random-secret>
-DATABASE_URL=<render-postgres-url>
+DATABASE_URL=<neon-connection-string>
 CORS_ORIGINS=https://<vercel-host>
 STORAGE_BACKEND=minio
 MINIO_ENDPOINT=<account-id>.r2.cloudflarestorage.com
@@ -62,6 +62,7 @@ MINIO_SECRET_KEY=<r2-secret-access-key>
 MINIO_BUCKET=<r2-bucket-name>
 MINIO_SECURE=true
 USE_CELERY=false
+ALLOW_REGISTRATION=true
 ```
 
 After the backend deploys, verify:
@@ -113,6 +114,8 @@ Run this through the final Vercel URL:
 10. Redeploy the Render backend.
 11. Confirm report metadata still loads.
 12. Confirm the uploaded object exists in the R2 bucket.
+13. Create any demo account you want to share, then set Render `ALLOW_REGISTRATION=false` and redeploy.
+14. Confirm signing up now fails with "Registration is closed".
 
 ## Release Checks
 

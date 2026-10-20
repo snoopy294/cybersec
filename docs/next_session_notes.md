@@ -26,12 +26,7 @@ The repo is already moving toward public deployment, but the hosted MVP should r
 
 ## Important Current Caveat
 
-There is a deployment config mismatch to fix:
-
-- Docs mention `BACKEND_URL` for the Vercel frontend.
-- `frontend/next.config.js` currently reads `NEXT_PUBLIC_API_URL`.
-
-Pick one name and make the docs and frontend config match before deploying.
+Resolved: the frontend now reads `BACKEND_URL`, matching the deployment docs.
 
 ## Public Web Requirements
 
@@ -74,7 +69,7 @@ Recommended practical sandbox options:
 
 ## Suggested Next Implementation Steps
 
-1. Fix the frontend deployment env var mismatch.
+1. ~~Fix the frontend deployment env var mismatch.~~ Done.
 2. Make the hosted MVP deploy cleanly with static analysis only.
 3. Add invite-only signup or admin-created tenant invites.
 4. Switch hosted analysis dispatch from background thread to a real queue/worker setup.

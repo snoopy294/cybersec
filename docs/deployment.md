@@ -4,7 +4,7 @@ This repo is set up for a split deployment:
 
 - Frontend: Vercel, using `frontend/` as the project root
 - Backend API: Render Docker web service, using `backend/` as the service root
-- Database: Render Postgres
+- Database: Neon Postgres (free tier)
 
 For the remaining hosted MVP rollout, see [MVP Deployment Plan](mvp_deployment_plan.md). For the exact deploy procedure and smoke test, use the [Deployment Runbook](deployment_runbook.md).
 
@@ -18,7 +18,7 @@ For the remaining hosted MVP rollout, see [MVP Deployment Plan](mvp_deployment_p
 ```env
 DEBUG=false
 CORS_ORIGINS=https://your-vercel-app.vercel.app
-DATABASE_URL=<Render Postgres connection string>
+DATABASE_URL=<Neon Postgres connection string>
 STORAGE_BACKEND=minio
 MINIO_ENDPOINT=<account-id>.r2.cloudflarestorage.com
 MINIO_ACCESS_KEY=<r2-access-key-id>
@@ -34,13 +34,27 @@ MAX_DAILY_UPLOAD_MB_PER_TENANT=1024
 RETENTION_DAYS=30
 RETENTION_MAX_JOBS_PER_TENANT=250
 EXPOSE_API_DOCS=false
+ALLOW_REGISTRATION=true  # set to false after creating your accounts
 ```
 
-Render commonly provides `DATABASE_URL` as `postgresql://...`; the backend normalizes it to the async URL used by SQLAlchemy and derives the sync URL used by the analysis worker.
+The backend normalizes a `postgresql://...` connection string (including Neon's `sslmode`/`channel_binding` params) to the async URL used by SQLAlchemy and derives the sync URL used by the analysis worker.
 
 Cloudflare R2 is the MVP object-storage target. Keep the R2 bucket private and set `MINIO_ENDPOINT` to the host-only account endpoint without `https://`.
 
 When `DEBUG=false`, the backend refuses to start with the default development secret, wildcard CORS origins, or local filesystem sample storage. This is intentional; uploaded samples must stay in private object storage for hosted environments.
+
+## Free Tier Notes
+
+Everything here runs on free tiers, which suits a personal, non-commercial project:
+
+- **Vercel Hobby**: free, non-commercial use only.
+- **Render free web service**: spins down after ~15 minutes idle; the first request afterwards takes up to a minute while it wakes.
+- **Neon Postgres** (instead of Render Postgres): Render's free Postgres is deleted 30 days after creation, Neon's free tier does not expire. Paste Neon's connection string as-is; the backend rewrites `sslmode`/`channel_binding` for asyncpg.
+- **Cloudflare R2**: 10 GB free, but Cloudflare requires a card or PayPal on file to enable R2.
+
+## Registration
+
+`ALLOW_REGISTRATION` defaults to `true`. After creating your own account (and a demo account to share), set it to `false` on Render and redeploy so strangers can't sign up and upload files.
 
 ## Frontend on Vercel
 

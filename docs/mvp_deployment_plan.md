@@ -7,7 +7,7 @@ This plan covers the remaining work to make SENTINEL a hosted MVP app:
 - Public landing page served by Vercel at `/`
 - Analyst dashboard served by Vercel at `/dashboard`
 - FastAPI backend deployed to Render
-- Postgres database hosted on Render
+- Postgres database hosted on Neon (free tier)
 - Uploaded samples stored durably in Cloudflare R2 through the existing MinIO/S3-compatible storage path
 - Repeatable verification checklist after every deploy
 
@@ -19,7 +19,7 @@ MVP means hosted and demonstrable. It does not mean fully production-hardened.
 | --- | --- | --- |
 | Frontend | Vercel | Project root: `frontend` |
 | Backend API | Render Docker web service | Service root: `backend`; blueprint: `render.yaml` |
-| Database | Render Postgres | `DATABASE_URL` injected into Render service |
+| Database | Neon Postgres (free) | `DATABASE_URL` set on Render service |
 | File storage | Cloudflare R2 | Use `STORAGE_BACKEND=minio` with R2 S3-compatible credentials |
 | Worker mode | Backend background thread | Keep `USE_CELERY=false` for MVP |
 
@@ -46,7 +46,7 @@ Set these on the Render backend service:
 ```env
 DEBUG=false
 CORS_ORIGINS=https://<vercel-host>
-DATABASE_URL=<render-postgres-connection-string>
+DATABASE_URL=<neon-connection-string>
 SECRET_KEY=<generated-secret>
 STORAGE_BACKEND=minio
 USE_CELERY=false
@@ -58,6 +58,7 @@ MAX_DAILY_UPLOAD_MB_PER_TENANT=1024
 RETENTION_DAYS=30
 RETENTION_MAX_JOBS_PER_TENANT=250
 EXPOSE_API_DOCS=false
+ALLOW_REGISTRATION=true  # false once your accounts exist
 ```
 
 Render commonly provides `DATABASE_URL` as `postgresql://...`. The backend normalizes that value for async SQLAlchemy and derives the sync URL used by the analysis worker.
@@ -81,7 +82,7 @@ Use the account-specific R2 S3 API endpoint. The MinIO client expects the endpoi
 1. Push the latest `main` branch to GitHub.
 2. Create a private Cloudflare R2 bucket for uploaded samples.
 3. Create a Cloudflare R2 API token/key pair with object read/write access to the bucket.
-4. Create a Render Postgres database.
+4. Create a free Neon Postgres project and copy its connection string.
 5. Deploy the Render backend from `render.yaml`.
 6. Set the Render environment variables listed above.
 7. Confirm the backend health endpoint:
@@ -174,7 +175,7 @@ Upload smoke test:
 
 ## Known MVP Limitations
 
-- There is no invite-only signup gate yet.
+- Signup is all-or-nothing: `ALLOW_REGISTRATION=false` closes it; there are no per-user invites.
 - Background-thread analysis is acceptable for the MVP but not ideal for long-running production jobs.
 - Malware sample handling still needs isolated execution infrastructure and operational safety rules before public launch.
 - The Cloudflare R2 bucket should remain private; do not enable public object access for uploaded samples.

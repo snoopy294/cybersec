@@ -83,3 +83,31 @@ def test_local_storage_delete_removes_file_and_empty_parents(monkeypatch):
 
     assert removed_files[0].endswith("sample.bin")
     assert removed_dirs[0].endswith("a" * 64)
+
+
+def test_register_rejected_when_registration_closed(monkeypatch):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from app.api import routes
+    from app.schemas.schemas import UserRegister
+
+    monkeypatch.setattr(routes.settings, "ALLOW_REGISTRATION", False)
+    data = UserRegister(email="new@example.com", password="BetterPassphrase2026!", tenant_name="Lab")
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(routes.register(request=None, data=data, db=None))
+
+    assert exc.value.status_code == 403
+
+
+def test_hosted_postgres_url_is_normalized_for_both_drivers():
+    from app.core.config import Settings
+
+    settings = Settings(
+        DATABASE_URL="postgresql://u:p@ep-x.neon.tech/db?sslmode=require&channel_binding=require"
+    )
+
+    assert settings.DATABASE_URL == "postgresql+asyncpg://u:p@ep-x.neon.tech/db?ssl=require"
+    assert settings.DATABASE_URL_SYNC == "postgresql://u:p@ep-x.neon.tech/db?sslmode=require"

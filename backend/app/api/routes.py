@@ -230,6 +230,8 @@ async def health_check(db: AsyncSession = Depends(get_db)):
 @auth_router.post("/register", response_model=TokenResponse, status_code=201)
 async def register(request: Request, data: UserRegister, db: AsyncSession = Depends(get_db)):
     """Register a new user and create their tenant."""
+    if not settings.ALLOW_REGISTRATION:
+        raise HTTPException(status_code=403, detail="Registration is closed")
     _auth_rate_limit(request, "register")
     try:
         validate_password_strength(data.password)

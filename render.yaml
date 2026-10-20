@@ -2,6 +2,7 @@ services:
   - type: web
     name: sentinel-api
     env: docker
+    plan: free
     rootDir: backend
     healthCheckPath: /api/v1/health
     envVars:
@@ -9,10 +10,9 @@ services:
         value: false
       - key: CORS_ORIGINS
         sync: false
+      # Free Neon Postgres connection string (Render's free Postgres expires).
       - key: DATABASE_URL
-        fromDatabase:
-          name: sentinel-db
-          property: connectionString
+        sync: false
       - key: STORAGE_BACKEND
         value: minio
       - key: MINIO_ENDPOINT
@@ -29,6 +29,6 @@ services:
         generateValue: true
       - key: USE_CELERY
         value: false
-
-databases:
-  - name: sentinel-db
+      # Create your accounts first, then flip this to false and redeploy.
+      - key: ALLOW_REGISTRATION
+        value: true
