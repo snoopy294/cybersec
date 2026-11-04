@@ -37,7 +37,7 @@ services:
         value: false
       # Keep in step with the frontend proxy body cap in next.config.js.
       - key: MAX_FILE_SIZE_MB
-        value: 10
+        value: 12
       # Render's proxy is the one hop in front of the API.
       - key: TRUSTED_PROXY_HOPS
         value: 1
