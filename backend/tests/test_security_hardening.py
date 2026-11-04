@@ -110,4 +110,4 @@ def test_hosted_postgres_url_is_normalized_for_both_drivers():
     )
 
     assert settings.DATABASE_URL == "postgresql+asyncpg://u:p@ep-x.neon.tech/db?ssl=require"
-    assert settings.DATABASE_URL_SYNC == "postgresql://u:p@ep-x.neon.tech/db?sslmode=require"
+    assert settings.DATABASE_URL_SYNC == "postgresql+psycopg2://u:p@ep-x.neon.tech/db?sslmode=require"

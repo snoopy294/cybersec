@@ -85,8 +85,10 @@ class Settings(BaseSettings):
             if self.DATABASE_URL.startswith("sqlite+aiosqlite://"):
                 self.DATABASE_URL_SYNC = self.DATABASE_URL.replace("sqlite+aiosqlite://", "sqlite://", 1)
             elif self.DATABASE_URL.startswith("postgresql+asyncpg://"):
+                # Name the driver: SQLAlchemy 2.1 defaults postgresql:// to psycopg,
+                # but requirements.txt installs psycopg2.
                 self.DATABASE_URL_SYNC = _rewrite_query(
-                    self.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1),
+                    self.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql+psycopg2://", 1),
                     {"ssl": "sslmode"},
                 )
             else:
