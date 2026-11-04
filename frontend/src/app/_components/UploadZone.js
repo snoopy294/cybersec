@@ -9,7 +9,12 @@ export default function UploadZone({ onFileSelect, disabled }) {
   const [error, setError] = useState("");
 
   const validateAndSubmit = (file) => {
-    if (!file) {
+    if (!file || disabled) {
+      return;
+    }
+
+    if (file.size === 0) {
+      setError("That file is empty. Choose a file with content.");
       return;
     }
 
@@ -45,7 +50,11 @@ export default function UploadZone({ onFileSelect, disabled }) {
       <input
         disabled={disabled}
         hidden
-        onChange={(event) => validateAndSubmit(event.target.files?.[0])}
+        onChange={(event) => {
+          validateAndSubmit(event.target.files?.[0]);
+          // Reset so choosing the same file again still fires onChange.
+          event.target.value = "";
+        }}
         ref={inputRef}
         type="file"
       />

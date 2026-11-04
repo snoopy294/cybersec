@@ -1,13 +1,24 @@
 """SENTINEL — Pydantic schemas for API request/response validation."""
 
 from __future__ import annotations
+import re
 from datetime import datetime
 from uuid import UUID
 from typing import Optional, List, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.models.models import TenantTier, UserRole, JobStatus, Verdict
+
+EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _clean_text(value: str, field_name: str) -> str:
+    value = value.strip()
+    if _CONTROL_CHARS.search(value):
+        raise ValueError(f"{field_name} contains invalid characters")
+    return value
 
 
 # ── Auth Schemas ─────────────────────────────────────────────────
@@ -17,11 +28,24 @@ class UserRegister(BaseModel):
         ...,
         min_length=3,
         max_length=320,
-        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+        pattern=EMAIL_PATTERN,
         description="User email address",
     )
-    password: str = Field(..., min_length=12, description="Password (min 12 chars)")
-    tenant_name: str = Field(..., min_length=1, description="Organization name")
+    password: str = Field(..., min_length=12, max_length=128, description="Password (min 12 chars)")
+    tenant_name: str = Field(..., min_length=1, max_length=100, description="Organization name")
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("tenant_name")
+    @classmethod
+    def clean_tenant_name(cls, value: str) -> str:
+        value = _clean_text(value, "Name")
+        if not value:
+            raise ValueError("Name is required")
+        return value
 
 
 class UserLogin(BaseModel):
@@ -29,9 +53,14 @@ class UserLogin(BaseModel):
         ...,
         min_length=3,
         max_length=320,
-        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+        pattern=EMAIL_PATTERN,
     )
-    password: str
+    password: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
 
 
 class TokenResponse(BaseModel):
@@ -132,8 +161,19 @@ class BehaviorSimilarityResponse(BaseModel):
 
 
 class DetectionPackRequest(BaseModel):
-    targets: List[str] = Field(default_factory=lambda: ["yara", "sigma", "splunk"])
-    strictness: str = "balanced"
+    targets: List[str] = Field(
+        default_factory=lambda: ["yara", "sigma", "splunk"],
+        min_length=1,
+        max_length=10,
+    )
+    strictness: str = Field("balanced", max_length=20)
+
+    @field_validator("targets")
+    @classmethod
+    def limit_target_length(cls, value: List[str]) -> List[str]:
+        if any(len(target) > 20 for target in value):
+            raise ValueError("Detection target names must be 20 characters or fewer")
+        return value
 
 
 class DetectionRuleResponse(BaseModel):
@@ -156,9 +196,27 @@ class DetectionPackResponse(BaseModel):
 # -- Feedback and Graph Schemas ------------------------------------------------
 
 class AnalystFeedbackRequest(BaseModel):
-    type: str = Field(..., min_length=1)
-    value: str = Field(..., min_length=1)
-    comment: Optional[str] = None
+    type: str = Field(..., min_length=1, max_length=32, pattern=r"^[a-z_]+$")
+    value: str = Field(..., min_length=1, max_length=200)
+    comment: Optional[str] = Field(None, max_length=2000)
+
+    @field_validator("value")
+    @classmethod
+    def clean_value(cls, value: str) -> str:
+        value = _clean_text(value, "Feedback value")
+        if not value:
+            raise ValueError("Feedback value is required")
+        return value
+
+    @field_validator("comment")
+    @classmethod
+    def clean_comment(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        # Comments may span lines; reject other control characters.
+        if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", value):
+            raise ValueError("Comment contains invalid characters")
+        return value.strip() or None
 
 
 class AnalystFeedbackEntry(BaseModel):

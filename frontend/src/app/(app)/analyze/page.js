@@ -1,5 +1,6 @@
 import AnalyzeClient from "../../_components/AnalyzeClient";
 
-export default function AnalyzePage({ searchParams }) {
-  return <AnalyzeClient initialJobId={searchParams?.job || null} />;
+export default async function AnalyzePage({ searchParams }) {
+  const { job } = (await searchParams) || {};
+  return <AnalyzeClient initialJobId={typeof job === "string" ? job : null} />;
 }

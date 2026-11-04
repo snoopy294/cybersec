@@ -107,7 +107,7 @@ class Tenant(Base):
     id = Column(GUID(), primary_key=True, default=_uuid)
     name = Column(String(255), nullable=False)
     tier = Column(String(20), nullable=False, default=TenantTier.FREE.value)
-    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
     # Relationships
     users = relationship("User", back_populates="tenant", cascade="all, delete-orphan")
@@ -123,7 +123,7 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(String(20), nullable=False, default=UserRole.ANALYST.value)
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
     # Relationships
     tenant = relationship("Tenant", back_populates="users")
@@ -139,8 +139,8 @@ class ApiKey(Base):
     prefix = Column(String(12), nullable=False)
     name = Column(String(100), nullable=False, default="Default")
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=_utcnow, nullable=False)
-    last_used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     user = relationship("User", back_populates="api_keys")
@@ -161,8 +161,8 @@ class AnalysisJob(Base):
     minio_object_path = Column(String(1024), nullable=False)
     error_message = Column(Text, nullable=True)
     progress_percent = Column(Integer, default=0, nullable=False)
-    created_at = Column(DateTime, default=_utcnow, nullable=False)
-    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     tenant = relationship("Tenant", back_populates="jobs")
@@ -183,7 +183,7 @@ class ThreatReport(Base):
     dynamic_data = Column(JSONType(), nullable=True)   # syscalls, network, behavior
     mitre_mappings = Column(JSONType(), nullable=True)  # ATT&CK technique IDs
     iocs = Column(JSONType(), nullable=True)            # IPs, domains, URLs, hashes
-    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
     # Relationships
     job = relationship("AnalysisJob", back_populates="report")

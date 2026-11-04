@@ -5,18 +5,43 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSentinelApp } from "./AppShell";
 import { VerdictBadge } from "./Badges";
+import { apiErrorMessage, isSha256 } from "../_lib/constants";
 
+// Report text includes strings pulled out of uploaded samples, so it is
+// attacker-controlled. Build React elements instead of injecting HTML.
 function MarkdownLine({ text }) {
-  const html = text
-    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>");
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).filter(Boolean);
 
-  return <p dangerouslySetInnerHTML={{ __html: html }} />;
+  return (
+    <p>
+      {parts.map((part, index) => {
+        if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+          return <strong key={index}>{part.slice(2, -2)}</strong>;
+        }
+        if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+          return <code key={index}>{part.slice(1, -1)}</code>;
+        }
+        return part;
+      })}
+    </p>
+  );
+}
+
+function ruleText(content) {
+  if (typeof content === "string") {
+    return content;
+  }
+  try {
+    return JSON.stringify(content, null, 2);
+  } catch {
+    return "Rule content could not be displayed.";
+  }
 }
 
 export default function ReportView({ reportHash }) {
   const router = useRouter();
-  const { apiClient, loadJobs, onAuthExpired } = useSentinelApp();
+  const { apiClient, loadJobs } = useSentinelApp();
+  const validHash = isSha256(reportHash);
   const [report, setReport] = useState(null);
   const [similar, setSimilar] = useState([]);
   const [detections, setDetections] = useState(null);
@@ -26,76 +51,103 @@ export default function ReportView({ reportHash }) {
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [feedbackStatus, setFeedbackStatus] = useState("");
+  const [savingFeedback, setSavingFeedback] = useState(false);
+  const [sectionErrors, setSectionErrors] = useState([]);
+  const [refreshError, setRefreshError] = useState("");
 
   const loadReport = useCallback(async () => {
+    if (!validHash) {
+      setError("That report link is invalid.");
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     setError("");
+    setSectionErrors([]);
 
     try {
-      const [reportResponse, similarResponse, detectionResponse] =
-        await Promise.all([
-          apiClient.get(`/report/${reportHash}`),
-          apiClient.get(`/report/${reportHash}/similar`),
-          apiClient.post(`/report/${reportHash}/detections`),
-        ]);
-
+      const reportResponse = await apiClient.get(`/report/${reportHash}`);
       setReport(reportResponse.data);
-      setSimilar(similarResponse.data.similar_reports || similarResponse.data.matches || []);
-      setDetections(detectionResponse.data);
       setFeedback({
         verdict: "",
         notes: "",
       });
     } catch (err) {
-      if (err.response?.status === 401) {
-        onAuthExpired();
-      } else {
-        const detail = err.response?.data?.detail;
-        setError(typeof detail === "string" ? detail : "Unable to load report");
+      if (err.response?.status !== 401) {
+        setError(apiErrorMessage(err, "Unable to load report."));
       }
-    } finally {
       setLoading(false);
+      return;
     }
-  }, [apiClient, onAuthExpired, reportHash]);
+
+    // Secondary panels should not take the whole report down if one fails.
+    const [similarResult, detectionResult] = await Promise.allSettled([
+      apiClient.get(`/report/${reportHash}/similar`),
+      apiClient.post(`/report/${reportHash}/detections`),
+    ]);
+    const problems = [];
+    if (similarResult.status === "fulfilled") {
+      const data = similarResult.value.data;
+      setSimilar(data.similar_reports || data.matches || []);
+    } else {
+      setSimilar([]);
+      problems.push(`Similar reports: ${apiErrorMessage(similarResult.reason)}`);
+    }
+    if (detectionResult.status === "fulfilled") {
+      setDetections(detectionResult.value.data);
+    } else {
+      setDetections(null);
+      problems.push(`Detection rules: ${apiErrorMessage(detectionResult.reason)}`);
+    }
+    setSectionErrors(problems);
+    setLoading(false);
+  }, [apiClient, reportHash, validHash]);
 
   useEffect(() => {
     loadReport();
   }, [loadReport]);
 
   const submitFeedback = async () => {
+    if (savingFeedback) {
+      return;
+    }
+    if (feedback.notes.length > 2000) {
+      setFeedbackStatus("Notes must be 2000 characters or fewer.");
+      return;
+    }
+
     setFeedbackStatus("");
+    setSavingFeedback(true);
 
     try {
       await apiClient.post(`/report/${reportHash}/feedback`, {
         type: "verdict",
         value: feedback.verdict || "reviewed",
-        comment: feedback.notes || null,
+        comment: feedback.notes.trim() || null,
       });
       setFeedbackStatus("Feedback saved");
       loadReport();
     } catch (err) {
-      if (err.response?.status === 401) {
-        onAuthExpired();
-      } else {
-        setFeedbackStatus("Unable to save feedback");
+      if (err.response?.status !== 401) {
+        setFeedbackStatus(apiErrorMessage(err, "Unable to save feedback."));
       }
+    } finally {
+      setSavingFeedback(false);
     }
   };
 
   const refreshReport = async () => {
     setRefreshing(true);
-    setError("");
+    setRefreshError("");
 
     try {
       const response = await apiClient.post(`/report/${reportHash}/refresh`);
       loadJobs();
       router.push(`/analyze?job=${response.data.job_id}`);
     } catch (err) {
-      if (err.response?.status === 401) {
-        onAuthExpired();
-      } else {
-        const detail = err.response?.data?.detail;
-        setError(typeof detail === "string" ? detail : "Unable to refresh report");
+      if (err.response?.status !== 401) {
+        setRefreshError(apiErrorMessage(err, "Unable to refresh report."));
       }
     } finally {
       setRefreshing(false);
@@ -127,6 +179,11 @@ export default function ReportView({ reportHash }) {
       <div className="empty-state">
         <h3>Report unavailable</h3>
         <p>{error}</p>
+        {validHash ? (
+          <button className="secondary-button" onClick={loadReport} type="button">
+            Try again
+          </button>
+        ) : null}
         <Link className="ghost-button" href="/reports">
           Back to reports
         </Link>
@@ -171,6 +228,11 @@ export default function ReportView({ reportHash }) {
           </button>
         </div>
       </div>
+
+      {refreshError ? <p className="form-error" role="alert">{refreshError}</p> : null}
+      {sectionErrors.map((message) => (
+        <p className="form-error" key={message} role="alert">{message}</p>
+      ))}
 
       <section className="report-hero">
         <div>
@@ -270,7 +332,7 @@ export default function ReportView({ reportHash }) {
           <article className="card">
             <h3>Sigma draft</h3>
             {detections?.rules?.length ? (
-              <pre>{detections.rules[0].content}</pre>
+              <pre>{ruleText(detections.rules[0].content)}</pre>
             ) : (
               <p className="muted">No detection rule generated.</p>
             )}
@@ -278,7 +340,7 @@ export default function ReportView({ reportHash }) {
           <article className="card">
             <h3>YARA draft</h3>
             {detections?.rules?.[1] ? (
-              <pre>{detections.rules[1].content}</pre>
+              <pre>{ruleText(detections.rules[1].content)}</pre>
             ) : (
               <p className="muted">No YARA draft generated.</p>
             )}
@@ -316,12 +378,18 @@ export default function ReportView({ reportHash }) {
                     notes: event.target.value,
                   }))
                 }
+                maxLength={2000}
                 placeholder="What did the analyst confirm or reject?"
                 value={feedback.notes}
               />
             </label>
-            <button className="primary-button" onClick={submitFeedback} type="button">
-              Save feedback
+            <button
+              className="primary-button"
+              disabled={savingFeedback}
+              onClick={submitFeedback}
+              type="button"
+            >
+              {savingFeedback ? "Saving..." : "Save feedback"}
             </button>
             {feedbackStatus ? <p className="muted">{feedbackStatus}</p> : null}
           </article>

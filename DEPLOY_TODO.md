@@ -41,6 +41,14 @@ Personal checklist for getting SENTINEL live on free tiers. Full details and tro
 - [ ] On Render, set `CORS_ORIGINS` = `https://<vercel-host>` and redeploy
 - [ ] Open `https://<vercel-host>/api/v1/health` and confirm it reaches the backend
 
+## 5b. Security update (validation + hardening)
+
+- [ ] Neon SQL Editor: convert timestamp columns to `timestamptz` (signup fails with a 500 until this runs). The `ALTER TABLE` statements are in the session notes; every `created_at`, `completed_at` and `last_used_at` column.
+- [ ] Render env: confirm `CORS_ORIGINS` is the exact `https://` Vercel URL. The backend now refuses to start if any origin isn't `https://`.
+- [ ] Render env: add `EXPOSE_API_DOCS=false`, `MAX_FILE_SIZE_MB=10`, `TRUSTED_PROXY_HOPS=1` (or run a Blueprint sync, which adds them)
+- [ ] Push to `main`, then check both deploys: Render health is `ok`, and Vercel shows the login page
+- [ ] `https://<render-host>/docs` returns 404
+
 ## 6. Smoke test
 
 - [ ] `/` landing page loads, `/dashboard` shows login
