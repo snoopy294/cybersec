@@ -562,8 +562,13 @@ async def get_report(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
+    file_name = await db.scalar(
+        select(AnalysisJob.file_name).where(AnalysisJob.id == report.job_id)
+    )
+
     return ThreatReportResponse(
         id=report.id,
+        file_name=file_name,
         file_hash_sha256=report.file_hash_sha256,
         severity_score=report.severity_score,
         verdict=report.verdict,

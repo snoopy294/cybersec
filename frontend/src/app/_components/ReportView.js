@@ -9,21 +9,119 @@ import { apiErrorMessage, isSha256 } from "../_lib/constants";
 
 // Report text includes strings pulled out of uploaded samples, so it is
 // attacker-controlled. Build React elements instead of injecting HTML.
-function MarkdownLine({ text }) {
+function inlineMarkdown(text) {
   const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).filter(Boolean);
 
+  return parts.map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return <strong key={index}>{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+      return <code key={index}>{part.slice(1, -1)}</code>;
+    }
+    return part;
+  });
+}
+
+function ReportMarkdown({ text }) {
+  const blocks = [];
+  let bullets = null;
+
+  text.split("\n").forEach((rawLine) => {
+    const line = rawLine.trim();
+    if (!line) {
+      bullets = null;
+    } else if (line.startsWith("- ")) {
+      if (!bullets) {
+        bullets = [];
+        blocks.push({ type: "list", items: bullets });
+      }
+      bullets.push(line.slice(2));
+    } else {
+      bullets = null;
+      const heading = line.match(/^#{1,6}\s+(.*)$/);
+      blocks.push(
+        heading
+          ? { type: "heading", text: heading[1] }
+          : { type: "paragraph", text: line },
+      );
+    }
+  });
+
+  // The title repeats the page header, so the report starts at its first section.
+  const body = blocks[0]?.type === "heading" ? blocks.slice(1) : blocks;
+
+  return body.map((block, index) => {
+    if (block.type === "heading") {
+      return <h4 key={index}>{block.text}</h4>;
+    }
+    if (block.type === "list") {
+      return (
+        <ul key={index}>
+          {block.items.map((item, itemIndex) => (
+            <li key={itemIndex}>{inlineMarkdown(item)}</li>
+          ))}
+        </ul>
+      );
+    }
+    return <p key={index}>{inlineMarkdown(block.text)}</p>;
+  });
+}
+
+function DocumentCard({ document }) {
+  const facts = [
+    ["Pages", document.page_count],
+    ["Title", document.title],
+    ["Author", document.author],
+    ["Created with", document.producer],
+    ["Active content", document.active_content?.join(", ") || "None"],
+    ["Attachments", document.attachments?.length || 0],
+  ].filter(([, value]) => value !== null && value !== undefined && value !== "");
+
   return (
-    <p>
-      {parts.map((part, index) => {
-        if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
-          return <strong key={index}>{part.slice(2, -2)}</strong>;
-        }
-        if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
-          return <code key={index}>{part.slice(1, -1)}</code>;
-        }
-        return part;
-      })}
-    </p>
+    <article className="card wide">
+      <h3>PDF document</h3>
+      {document.parse_warning ? <p className="form-error">{document.parse_warning}</p> : null}
+      {document.encrypted ? (
+        <p className="muted">This PDF requires a password, so its contents could not be inspected.</p>
+      ) : (
+        <div className="content-grid two">
+          <div className="key-value-list">
+            {facts.map(([label, value]) => (
+              <div key={label}>
+                <span>{label}</span>
+                <strong>{String(value)}</strong>
+              </div>
+            ))}
+            {document.attachments?.map((attachment) => (
+              <div key={attachment.name}>
+                <span>{attachment.executable ? "Executable attachment" : "Attachment"}</span>
+                <strong>{attachment.name}</strong>
+              </div>
+            ))}
+          </div>
+          <div>
+            <h4 className="document-text-heading">Extracted text</h4>
+            {document.text_preview ? (
+              <>
+                <pre className="document-text">{document.text_preview}</pre>
+                {document.text_truncated ? (
+                  <p className="muted">
+                    Showing the start of {document.text_characters.toLocaleString()} extracted characters.
+                  </p>
+                ) : null}
+              </>
+            ) : (
+              <p className="muted">
+                {document.parsed
+                  ? "No extractable text. This PDF may contain only scanned images."
+                  : "Text could not be extracted."}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+    </article>
   );
 }
 
@@ -196,15 +294,15 @@ export default function ReportView({ reportHash }) {
   }
 
   const tabs = ["summary", "indicators", "detections", "feedback"];
-  const reportTitle = report.filename || report.file_name || "Threat report";
-  const reportHashValue = report.file_hash || report.file_hash_sha256 || reportHash;
-  const reportScore = report.score ?? report.severity_score ?? 0;
+  const reportTitle = report.file_name || "Threat report";
+  const reportHashValue = report.file_hash_sha256 || reportHash;
+  const reportScore = report.severity_score ?? 0;
   const reportSummary =
-    report.summary ||
-    (report.ai_narrative || "")
-      .split("\n")
-      .find((line) => line.trim() && !line.trim().startsWith("#")) ||
-    "Automated static analysis report is available.";
+    report.static_data?.summary ||
+    "This report predates the latest analyzer. Use Refresh analysis to update it.";
+  const riskReasons = report.static_data?.risk_reasons || [];
+  const capabilities = report.static_data?.behavior_profile?.capabilities || [];
+  const reportDocument = report.static_data?.document;
 
   return (
     <>
@@ -271,18 +369,43 @@ export default function ReportView({ reportHash }) {
 
       {activeTab === "summary" ? (
         <section className="content-grid two">
+          {riskReasons.length ? (
+            <article className="card wide">
+              <h3>Why this verdict</h3>
+              <ul className="reason-list">
+                {riskReasons.map((reason) => (
+                  <li key={reason}>{reason}</li>
+                ))}
+              </ul>
+            </article>
+          ) : null}
+
+          {reportDocument ? <DocumentCard document={reportDocument} /> : null}
+
           <article className="card">
             <h3>Behavior profile</h3>
-            <div className="key-value-list">
-              {Object.entries(report.static_data?.behavior_profile || {}).map(
-                ([key, value]) => (
-                  <div key={key}>
-                    <span>{key.replaceAll("_", " ")}</span>
-                    <strong>{String(value)}</strong>
+            {capabilities.length ? (
+              <div className="capability-list">
+                {capabilities.map((capability) => (
+                  <div className="behavior-row" key={capability.name}>
+                    <div>
+                      <div className="behavior-title">{capability.label}</div>
+                      <div className="behavior-meta">
+                        {Math.round(capability.confidence * 100)}% confidence
+                        {capability.mitre?.length ? ` - ${capability.mitre.join(", ")}` : ""}
+                      </div>
+                    </div>
+                    <div className="behavior-evidence">
+                      {capability.evidence?.slice(0, 5).map((item) => (
+                        <code key={item} title={item}>{item}</code>
+                      ))}
+                    </div>
                   </div>
-                ),
-              )}
-            </div>
+                ))}
+              </div>
+            ) : (
+              <p className="muted">No risky behavior detected.</p>
+            )}
           </article>
 
           <article className="card">
@@ -304,6 +427,13 @@ export default function ReportView({ reportHash }) {
               <p className="muted">No related samples yet.</p>
             )}
           </article>
+
+          {report.ai_narrative ? (
+            <article className="card wide report-markdown">
+              <h3>Full report</h3>
+              <ReportMarkdown text={report.ai_narrative} />
+            </article>
+          ) : null}
         </section>
       ) : null}
 
@@ -392,17 +522,6 @@ export default function ReportView({ reportHash }) {
               {savingFeedback ? "Saving..." : "Save feedback"}
             </button>
             {feedbackStatus ? <p className="muted">{feedbackStatus}</p> : null}
-          </article>
-
-          <article className="card markdown-card">
-            <h3>Markdown report</h3>
-            {(report.markdown_report || "")
-              .split("\n")
-              .filter(Boolean)
-              .slice(0, 12)
-              .map((line, index) => (
-                <MarkdownLine key={`${line}-${index}`} text={line} />
-              ))}
           </article>
         </section>
       ) : null}

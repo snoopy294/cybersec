@@ -12,6 +12,7 @@ Supports two modes:
 """
 
 import hashlib
+import io
 import json
 import logging
 import re
@@ -21,6 +22,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+from pypdf import PasswordType, PdfReader
+from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -34,7 +37,7 @@ except ImportError:  # pragma: no cover - fallback keeps local dev usable before
 
 settings = get_settings()
 logger = logging.getLogger("sentinel.worker")
-ANALYZER_VERSION = "behavior-v5"
+ANALYZER_VERSION = "behavior-v6"
 
 # Synchronous DB session for the analysis worker
 # pool_pre_ping: hosted Postgres (Neon) closes idle connections between jobs.
@@ -225,6 +228,21 @@ def _ioc_values(strings: list[dict], classification: str) -> list[str]:
             seen.add(key)
             values.append(value)
     return values
+
+
+def _build_iocs(ioc_strings: list[dict]) -> dict:
+    """Group classified strings into the report's indicator lists."""
+    return {
+        "urls": _ioc_values(ioc_strings, "URL"),
+        "ips": _ioc_values(ioc_strings, "IP_ADDRESS"),
+        "domains": _ioc_values(ioc_strings, "DOMAIN"),
+        "emails": _ioc_values(ioc_strings, "EMAIL"),
+        "registry_keys": _ioc_values(ioc_strings, "REGISTRY_KEY"),
+        "file_paths": _ioc_values(ioc_strings, "FILE_PATH"),
+        "commands": _ioc_values(ioc_strings, "COMMAND"),
+        "windows_privileges": _ioc_values(ioc_strings, "WINDOWS_PRIVILEGE"),
+        "crypto_wallets": _ioc_values(ioc_strings, "CRYPTO_WALLET"),
+    }
 
 
 def _analyze_pe_headers(data: bytes) -> dict | None:
@@ -807,6 +825,330 @@ def _find_behavior_matches(session, current_job, static_data: dict, iocs_dict: d
     }
 
 
+# ── PDF Analysis ─────────────────────────────────────────────────
+
+MAX_PDF_TEXT_PAGES = 200
+MAX_PDF_TEXT_CHARS = 200_000
+MAX_PDF_PREVIEW_CHARS = 6_000
+MAX_PDF_OBJECTS = 100_000
+MAX_PDF_ATTACHMENTS = 20
+MAX_PDF_INDICATOR_TOKENS = 50_000
+
+PDF_RISKY_ACTIONS = {
+    "/JavaScript": "JavaScript",
+    "/Launch": "Launch",
+    "/SubmitForm": "SubmitForm",
+    "/ImportData": "ImportData",
+    "/GoToE": "GoToE",
+}
+PDF_ACTIVE_CONTENT_RISKS = {
+    "Launch": (40, "Contains an action that launches an external program"),
+    "JavaScript": (30, "Contains embedded JavaScript"),
+    "OpenAction": (15, "Runs an action automatically when the document is opened"),
+    "SubmitForm": (10, "Contains an action that submits form data to a remote address"),
+    "ImportData": (10, "Contains an action that imports external data"),
+    "GoToE": (10, "Contains an action that opens an embedded document"),
+    "RichMedia": (10, "Contains embedded rich media"),
+    "XFA": (5, "Contains a dynamic XFA form"),
+}
+PDF_EXECUTABLE_EXTENSIONS = (
+    ".exe", ".dll", ".scr", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".vbe",
+    ".js", ".jse", ".wsf", ".hta", ".msi", ".lnk", ".jar", ".sh",
+)
+PDF_EXECUTABLE_MAGIC = (b"MZ", b"\x7fELF")
+# Prose tokens like "Node.js", "report.pdf", or "end.Next" look like domains, so
+# bare hostnames in document text need a recognizable top-level domain.
+COMMON_TLDS = {
+    "com", "net", "org", "edu", "gov", "mil", "int", "info", "biz", "io", "ai",
+    "co", "app", "dev", "xyz", "top", "site", "online", "club", "us", "uk", "ca",
+    "au", "de", "fr", "nl", "ru", "cn", "jp", "in", "br",
+}
+PDF_TEXT_INDICATOR_TYPES = {"URL", "IP_ADDRESS", "EMAIL", "DOMAIN"}
+
+
+def _is_pdf(data: bytes) -> bool:
+    return b"%PDF-" in data[:1024]
+
+
+def _clean_pdf_text(text: str) -> str:
+    lines = (re.sub(r"[ \t\f\v\xa0]+", " ", line).strip() for line in text.splitlines())
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", cleaned)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def _pdf_metadata_value(value) -> str | None:
+    if value is None:
+        return None
+    text = _clean_pdf_text(str(value))
+    return text[:300] or None
+
+
+def _pdf_string_bytes(value) -> bytes:
+    """Return the bytes of a PDF script value, which may be a string or a stream."""
+    value = value.get_object() if isinstance(value, IndirectObject) else value
+    if hasattr(value, "get_data"):
+        return value.get_data()
+    return str(value).encode("utf-8", errors="ignore")
+
+
+def _scan_pdf_objects(reader: PdfReader) -> dict:
+    """Walk objects reachable from the catalog for actions, scripts, and links."""
+    active = set()
+    uris = []
+    scripts = []
+    stack = [reader.trailer["/Root"]]
+    seen = set()
+    visited = 0
+
+    while stack and visited < MAX_PDF_OBJECTS:
+        item = stack.pop()
+        visited += 1
+        if isinstance(item, IndirectObject):
+            key = (item.idnum, item.generation)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                item = item.get_object()
+            except Exception:
+                continue
+
+        if isinstance(item, ArrayObject):
+            stack.extend(list.__iter__(item))
+            continue
+        if not isinstance(item, DictionaryObject):
+            continue
+
+        action = dict.get(item, "/S")
+        action = action.get_object() if isinstance(action, IndirectObject) else action
+        if action in PDF_RISKY_ACTIONS:
+            active.add(PDF_RISKY_ACTIONS[action])
+        if action == "/URI" and "/URI" in item:
+            uris.append(str(item["/URI"]))
+        if "/JS" in item:
+            active.add("JavaScript")
+            try:
+                scripts.append(_pdf_string_bytes(dict.get(item, "/JS")))
+            except Exception:
+                logger.warning("Could not decode a PDF script object", exc_info=True)
+        if "/XFA" in item:
+            active.add("XFA")
+        if dict.get(item, "/Subtype") == "/RichMedia":
+            active.add("RichMedia")
+        if "/OpenAction" in item:
+            # An array is just "open at this page"; a non-GoTo dictionary runs something.
+            target = item["/OpenAction"]
+            if isinstance(target, DictionaryObject) and target.get("/S") != "/GoTo":
+                active.add("OpenAction")
+
+        stack.extend(dict.values(item))
+
+    return {
+        "active": active,
+        "uris": uris,
+        "scripts": scripts,
+        "truncated": bool(stack),
+    }
+
+
+def _pdf_page_text(reader: PdfReader) -> tuple[str, bool]:
+    """Extract visible page text, returning the text and whether it was cut short."""
+    chunks = []
+    total = 0
+    for index, page in enumerate(reader.pages):
+        if index >= MAX_PDF_TEXT_PAGES or total >= MAX_PDF_TEXT_CHARS:
+            return "\n\n".join(chunks)[:MAX_PDF_TEXT_CHARS], True
+        try:
+            page_text = _clean_pdf_text(page.extract_text() or "")
+        except Exception:
+            logger.warning("Could not extract text from PDF page %s", index, exc_info=True)
+            continue
+        if page_text:
+            chunks.append(page_text)
+            total += len(page_text)
+    text = "\n\n".join(chunks)
+    return text[:MAX_PDF_TEXT_CHARS], len(text) > MAX_PDF_TEXT_CHARS
+
+
+def _pdf_attachments(reader: PdfReader) -> tuple[list[dict], list[dict]]:
+    """List embedded files and return their extracted strings as active evidence."""
+    attachments = []
+    strings = []
+    for name, payloads in reader.attachments.items():
+        for payload in payloads:
+            if len(attachments) >= MAX_PDF_ATTACHMENTS:
+                return attachments, strings
+            attachments.append({
+                "name": str(name)[:200],
+                "size_bytes": len(payload),
+                "executable": (
+                    str(name).lower().endswith(PDF_EXECUTABLE_EXTENSIONS)
+                    or payload.startswith(PDF_EXECUTABLE_MAGIC)
+                ),
+            })
+            strings.extend(_extract_strings(payload))
+    return attachments, strings
+
+
+def _text_indicator_strings(text: str, link_uris: list[str]) -> list[dict]:
+    """Find network indicators in document text and link annotations.
+
+    Tokens are classified one at a time because a line can hold several
+    indicators, while each string only gets one classification.
+    """
+    results = []
+    seen = set()
+    tokens = [uri.removeprefix("mailto:") for uri in link_uris]
+    tokens.extend(text.split()[:MAX_PDF_INDICATOR_TOKENS])
+
+    for raw_token in tokens:
+        token = raw_token.strip(".,;:!?()[]{}<>\"'")
+        if not 4 <= len(token) <= 2048 or not any(mark in token for mark in ".@:"):
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        classification = _classify_string(token)
+        if classification not in PDF_TEXT_INDICATOR_TYPES:
+            continue
+        if classification == "DOMAIN" and key.rsplit(".", 1)[-1] not in COMMON_TLDS:
+            continue
+        results.append({
+            "value": token,
+            "encoding": "pdf-text",
+            "offset": 0,
+            "classification": classification,
+        })
+    return results
+
+
+def _analyze_pdf(data: bytes) -> dict:
+    """Parse a PDF into visible text, structure, and active-content evidence.
+
+    Page text and links are returned separately from `active_strings`: what a
+    document talks about is not something it does, so only scripts and
+    attachments feed the behavior profile.
+    """
+    document = {
+        "type": "pdf",
+        "parsed": False,
+        "encrypted": False,
+        "page_count": None,
+        "title": None,
+        "author": None,
+        "producer": None,
+        "text_preview": "",
+        "text_characters": 0,
+        "text_truncated": False,
+        "active_content": [],
+        "attachments": [],
+        "parse_warning": None,
+    }
+    result = {"document": document, "text_strings": [], "active_strings": []}
+
+    try:
+        reader = PdfReader(io.BytesIO(data), strict=False)
+        if reader.is_encrypted and reader.decrypt("") == PasswordType.NOT_DECRYPTED:
+            document["parsed"] = True
+            document["encrypted"] = True
+            return result
+
+        document["page_count"] = len(reader.pages)
+        scan = _scan_pdf_objects(reader)
+        text, truncated = _pdf_page_text(reader)
+        attachments, attachment_strings = _pdf_attachments(reader)
+    except Exception as exc:
+        logger.info("PDF parse failed, using raw string scan: %s", exc)
+        document["parse_warning"] = (
+            "This file could not be parsed as a PDF, so a raw byte scan was used "
+            "and results may include noise."
+        )
+        return result
+
+    try:
+        metadata = reader.metadata or {}
+        document["title"] = _pdf_metadata_value(metadata.get("/Title"))
+        document["author"] = _pdf_metadata_value(metadata.get("/Author"))
+        document["producer"] = _pdf_metadata_value(metadata.get("/Producer"))
+    except Exception:
+        logger.warning("Could not read PDF metadata", exc_info=True)
+
+    document["parsed"] = True
+    document["text_preview"] = text[:MAX_PDF_PREVIEW_CHARS]
+    document["text_characters"] = len(text)
+    document["text_truncated"] = truncated or len(text) > MAX_PDF_PREVIEW_CHARS
+    document["active_content"] = sorted(scan["active"])
+    document["attachments"] = attachments
+    if scan["truncated"]:
+        document["parse_warning"] = "This PDF has too many objects to scan completely."
+
+    script_strings = [
+        item for script in scan["scripts"] for item in _extract_strings(script)
+    ]
+    result["text_strings"] = _text_indicator_strings(text, scan["uris"])
+    result["active_strings"] = script_strings + attachment_strings
+    return result
+
+
+def _score_pdf(document: dict) -> tuple[int, list[str]]:
+    """Score a parsed PDF on what it can do when opened, not how it is encoded."""
+    score = 0
+    reasons = []
+
+    if document["encrypted"]:
+        score += 30
+        reasons.append("Requires a password, so its contents could not be inspected")
+
+    for name, (weight, reason) in PDF_ACTIVE_CONTENT_RISKS.items():
+        if name in document["active_content"]:
+            score += weight
+            reasons.append(reason)
+
+    executables = [item["name"] for item in document["attachments"] if item["executable"]]
+    if executables:
+        score += 40
+        reasons.append("Embeds executable or script file(s): " + ", ".join(executables[:5]))
+    other_count = len(document["attachments"]) - len(executables)
+    if other_count:
+        score += min(other_count * 5, 15)
+        reasons.append(f"Embeds {other_count} other file attachment(s)")
+
+    return score, reasons
+
+
+def _build_summary(verdict: str, reasons: list[str], document: dict | None, iocs: dict) -> str:
+    """Write a plain-language summary for the top of the report."""
+    sentences = []
+    if document and document["parsed"]:
+        if document["encrypted"]:
+            sentences.append("Password-protected PDF, so its contents could not be inspected.")
+        else:
+            pages = document["page_count"]
+            noun = "page" if pages == 1 else "pages"
+            if document["text_characters"]:
+                sentences.append(f"PDF document with {pages} {noun} of extractable text.")
+            else:
+                sentences.append(
+                    f"PDF document with {pages} {noun} and no extractable text; it may be scanned images."
+                )
+            if not document["active_content"] and not document["attachments"]:
+                sentences.append("No scripts, automatic actions, or attachments were found.")
+
+    if verdict != "BENIGN" and reasons:
+        sentences.append(f"Main concern: {reasons[0].rstrip('.')}.")
+    elif not sentences:
+        sentences.append("No specific high-risk behavior was found.")
+
+    indicator_count = sum(len(values) for values in iocs.values())
+    if indicator_count:
+        noun = "indicator" if indicator_count == 1 else "indicators"
+        sentences.append(f"{indicator_count} {noun} extracted for review.")
+    return " ".join(sentences)
+
+
 # ── Core Analysis Function ───────────────────────────────────────
 
 # Shown to users; the underlying exception only goes to the server log.
@@ -850,33 +1192,45 @@ def run_analysis(job_id: str):
 
         # ── Stage 3: Static analysis ────────────────────────────
         pe_info = _analyze_pe_headers(file_data)
-        strings = _extract_strings(file_data)
         entropy = _compute_entropy(file_data)
+        pdf_info = _analyze_pdf(file_data) if pe_info is None and _is_pdf(file_data) else None
+        document = pdf_info["document"] if pdf_info else None
+        pdf_parsed = bool(document and document["parsed"])
+
+        if pdf_parsed:
+            behavior_strings = pdf_info["active_strings"]
+            strings = pdf_info["text_strings"] + behavior_strings
+        else:
+            strings = _extract_strings(file_data)
+            behavior_strings = strings
 
         ioc_strings = [s for s in strings if s["classification"] != "UNKNOWN"]
-        iocs_dict = {
-            "urls": _ioc_values(ioc_strings, "URL"),
-            "ips": _ioc_values(ioc_strings, "IP_ADDRESS"),
-            "domains": _ioc_values(ioc_strings, "DOMAIN"),
-            "emails": _ioc_values(ioc_strings, "EMAIL"),
-            "registry_keys": _ioc_values(ioc_strings, "REGISTRY_KEY"),
-            "file_paths": _ioc_values(ioc_strings, "FILE_PATH"),
-            "commands": _ioc_values(ioc_strings, "COMMAND"),
-            "windows_privileges": _ioc_values(ioc_strings, "WINDOWS_PRIVILEGE"),
-            "crypto_wallets": _ioc_values(ioc_strings, "CRYPTO_WALLET"),
-        }
+        iocs_dict = _build_iocs(ioc_strings)
         high_entropy_sections = [
             section for section in (pe_info or {}).get("sections", [])
             if section.get("high_entropy")
         ]
         import_risks = _summarize_import_risks(pe_info)
-        behavior_profile = _build_behavior_profile(strings, iocs_dict, entropy, pe_info)
-        benign_context = _benign_software_context(job.file_name, strings)
-        dependency_context = _dependency_install_context(job.file_name, strings, iocs_dict["urls"])
+        if pdf_parsed:
+            # Compression makes whole-file entropy meaningless, and links in a
+            # document are not network behavior. Only active content counts.
+            behavior_iocs = _build_iocs(
+                [s for s in behavior_strings if s["classification"] != "UNKNOWN"]
+            )
+            behavior_profile = _build_behavior_profile(behavior_strings, behavior_iocs, 0.0, pe_info)
+            # Page text and file names are attacker-controlled, so they must not
+            # be able to earn the legitimate-software score reduction.
+            benign_context = []
+            dependency_context = []
+        else:
+            behavior_profile = _build_behavior_profile(strings, iocs_dict, entropy, pe_info)
+            benign_context = _benign_software_context(job.file_name, strings)
+            dependency_context = _dependency_install_context(job.file_name, strings, iocs_dict["urls"])
         dependency_urls = _dependency_repository_urls(iocs_dict["urls"])
         has_strong_signal = _has_strong_malicious_signal(behavior_profile)
 
         static_data = {
+            "document": document,
             "analyzer_version": ANALYZER_VERSION,
             "pe_headers": _pe_summary_for_report(pe_info),
             "pe_sections": (pe_info or {}).get("sections", []),
@@ -886,7 +1240,7 @@ def run_analysis(job_id: str):
             "strings_sample": strings[:500],
             "iocs_extracted": ioc_strings,
             "entropy": entropy,
-            "high_entropy": entropy > 7.0,
+            "high_entropy": entropy > 7.0 and not pdf_parsed,
             "high_entropy_sections": high_entropy_sections,
             "import_risks": import_risks,
             "behavior_profile": behavior_profile,
@@ -905,42 +1259,45 @@ def run_analysis(job_id: str):
         score = 0
         reasons = []
 
-        if entropy > 7.0:
-            score += 15
-            reasons.append("High entropy suggests packed or encrypted content")
+        if pdf_parsed:
+            score, reasons = _score_pdf(document)
+        else:
+            if entropy > 7.0:
+                score += 15
+                reasons.append("High entropy suggests packed or encrypted content")
 
-        if high_entropy_sections:
-            score += min(len(high_entropy_sections) * 15, 30)
-            section_names = ", ".join(section["name"] for section in high_entropy_sections[:5])
-            reasons.append(f"High-entropy PE section(s): {section_names}")
+            if high_entropy_sections:
+                score += min(len(high_entropy_sections) * 15, 30)
+                section_names = ", ".join(section["name"] for section in high_entropy_sections[:5])
+                reasons.append(f"High-entropy PE section(s): {section_names}")
 
-        url_count = len(iocs_dict["urls"])
-        ip_count = len(iocs_dict["ips"])
-        domain_count = len(iocs_dict["domains"])
-        reg_count = len(iocs_dict["registry_keys"])
-        scored_url_count = url_count
-        if dependency_context and dependency_urls and not has_strong_signal:
-            scored_url_count = max(0, url_count - len(dependency_urls))
-            reasons.append(
-                f"Recognized {len(dependency_urls)} package repository URL(s) as dependency-install context"
-            )
+            url_count = len(iocs_dict["urls"])
+            ip_count = len(iocs_dict["ips"])
+            domain_count = len(iocs_dict["domains"])
+            reg_count = len(iocs_dict["registry_keys"])
+            scored_url_count = url_count
+            if dependency_context and dependency_urls and not has_strong_signal:
+                scored_url_count = max(0, url_count - len(dependency_urls))
+                reasons.append(
+                    f"Recognized {len(dependency_urls)} package repository URL(s) as dependency-install context"
+                )
 
-        if scored_url_count > 0:
-            url_weight = 2 if dependency_context and not has_strong_signal else 3
-            url_cap = 6 if dependency_context and not has_strong_signal else 12
-            score += min(scored_url_count * url_weight, url_cap)
-            reasons.append(f"Contains {scored_url_count} non-package embedded URL(s)")
-        if ip_count > 0:
-            score += min(ip_count * 5, 15)
-            reasons.append(f"Contains {ip_count} embedded IP address(es)")
-        if domain_count > 0:
-            score += min(domain_count * 3, 12)
-            reasons.append(f"Contains {domain_count} embedded domain(s)")
-        if reg_count > 0:
-            reg_weight = 2 if dependency_context and not has_strong_signal else 5
-            reg_cap = 4 if dependency_context and not has_strong_signal else 10
-            score += min(reg_count * reg_weight, reg_cap)
-            reasons.append(f"References {reg_count} registry key(s)")
+            if scored_url_count > 0:
+                url_weight = 2 if dependency_context and not has_strong_signal else 3
+                url_cap = 6 if dependency_context and not has_strong_signal else 12
+                score += min(scored_url_count * url_weight, url_cap)
+                reasons.append(f"Contains {scored_url_count} non-package embedded URL(s)")
+            if ip_count > 0:
+                score += min(ip_count * 5, 15)
+                reasons.append(f"Contains {ip_count} embedded IP address(es)")
+            if domain_count > 0:
+                score += min(domain_count * 3, 12)
+                reasons.append(f"Contains {domain_count} embedded domain(s)")
+            if reg_count > 0:
+                reg_weight = 2 if dependency_context and not has_strong_signal else 5
+                reg_cap = 4 if dependency_context and not has_strong_signal else 10
+                score += min(reg_count * reg_weight, reg_cap)
+                reasons.append(f"References {reg_count} registry key(s)")
 
         if import_risks:
             score += min(len(import_risks) * 8, 32)
@@ -1004,6 +1361,9 @@ def run_analysis(job_id: str):
         else:
             verdict = Verdict.BENIGN
 
+        static_data["risk_reasons"] = reasons
+        static_data["summary"] = _build_summary(verdict.value, reasons, document, iocs_dict)
+
         # ── Generate narrative ───────────────────────────────────
         narrative = f"## Automated Static Analysis Report\n\n"
         narrative += f"**File:** {job.file_name}\n"
@@ -1019,6 +1379,18 @@ def run_analysis(job_id: str):
             narrative += f"- Exported Symbols: {len(pe_info.get('exports', []))}\n"
             if pe_info.get('compile_date'):
                 narrative += f"- Compile Date: {pe_info['compile_date']}\n"
+            narrative += "\n"
+
+        if pdf_parsed:
+            narrative += "### PDF Structure\n"
+            if document["encrypted"]:
+                narrative += "- Password protected: contents could not be inspected\n"
+            else:
+                narrative += f"- Pages: {document['page_count']}\n"
+                narrative += f"- Extracted text: {document['text_characters']:,} characters\n"
+                active_content = ", ".join(document["active_content"]) or "None"
+                narrative += f"- Active content: {active_content}\n"
+                narrative += f"- Attachments: {len(document['attachments'])}\n"
             narrative += "\n"
 
         if high_entropy_sections:
@@ -1053,11 +1425,12 @@ def run_analysis(job_id: str):
         if reasons:
             narrative += "### Risk Indicators\n"
             for r in reasons:
-                narrative += f"- Warning: {r}\n"
+                narrative += f"- {r}\n"
             narrative += "\n"
 
         if ioc_strings:
-            narrative += f"### Indicators of Compromise ({len(ioc_strings)} found)\n"
+            heading = "Indicators Found" if pdf_parsed else "Indicators of Compromise"
+            narrative += f"### {heading} ({len(ioc_strings)} found)\n"
             for ioc in ioc_strings[:10]:
                 narrative += f"- [{ioc['classification']}] `{ioc['value']}`\n"
 

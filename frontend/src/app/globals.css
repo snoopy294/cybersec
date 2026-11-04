@@ -1163,8 +1163,7 @@ button:disabled,
   letter-spacing: 1px;
 }
 
-.ioc-group code,
-.markdown-card code {
+.ioc-group code {
   width: fit-content;
   max-width: 100%;
   overflow-wrap: anywhere;
@@ -1189,13 +1188,73 @@ button:disabled,
   white-space: pre;
 }
 
-.markdown-card {
-  max-height: 560px;
-  overflow: auto;
+.workspace-header > div:first-child {
+  min-width: 0;
 }
 
-.markdown-card p {
-  margin-bottom: 10px;
+.workspace-header p {
+  overflow-wrap: anywhere;
+}
+
+.reason-list,
+.report-markdown ul {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 14px;
+  padding-left: 20px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.reason-list {
+  margin-bottom: 0;
+}
+
+.report-markdown h4 {
+  margin: 18px 0 8px;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.report-markdown p {
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+}
+
+.report-markdown code {
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-primary);
+  color: var(--accent-secondary);
+  font-size: 12px;
+}
+
+.capability-list {
+  display: grid;
+  gap: 10px;
+}
+
+.capability-list .behavior-row {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+
+.capability-list .behavior-evidence {
+  justify-content: flex-start;
+}
+
+.document-text-heading {
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.card pre.document-text {
+  max-height: 360px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
 }
 
 .muted {
