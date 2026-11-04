@@ -12,7 +12,14 @@ import {
 } from "react";
 import axios from "axios";
 import AuthPanel from "./AuthPanel";
-import { API_BASE, SESSION_KEY } from "../_lib/constants";
+import {
+  ACTIVE_STATUSES,
+  API_BASE,
+  API_TIMEOUT_MS,
+  SESSION_KEY,
+  apiErrorMessage,
+  tokenExpiresAt,
+} from "../_lib/constants";
 
 const SentinelAppContext = createContext(null);
 
@@ -25,7 +32,12 @@ const navItems = [
 
 function normalizeStoredSession(value) {
   const token = value?.token || value?.access_token;
-  if (!token) {
+  if (typeof token !== "string" || !token) {
+    return null;
+  }
+
+  const expiresAt = tokenExpiresAt(token);
+  if (!expiresAt || expiresAt <= Date.now()) {
     return null;
   }
 
@@ -64,6 +76,7 @@ export default function AppShell({ children }) {
   const [session, setSession] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [jobs, setJobs] = useState([]);
+  const [jobsError, setJobsError] = useState("");
   const [stats, setStats] = useState({
     total: 0,
     completed: 0,
@@ -90,23 +103,33 @@ export default function AppShell({ children }) {
     setAuthReady(true);
   }, []);
 
+  const handleAuthExpired = useCallback(() => {
+    localStorage.removeItem(SESSION_KEY);
+    setSession(null);
+    setJobs([]);
+    setJobsError("");
+    setStats({ total: 0, completed: 0, running: 0, malicious: 0 });
+  }, []);
+
   const apiClient = useMemo(() => {
     const client = axios.create({
       baseURL: API_BASE,
+      timeout: API_TIMEOUT_MS,
       headers: session?.token
         ? { Authorization: `Bearer ${session.token}` }
         : undefined,
     });
 
-    return client;
-  }, [session]);
+    // Any 401 means the session is gone; send the person back to sign in.
+    client.interceptors.response.use(undefined, (error) => {
+      if (error.response?.status === 401) {
+        handleAuthExpired();
+      }
+      return Promise.reject(error);
+    });
 
-  const handleAuthExpired = useCallback(() => {
-    localStorage.removeItem(SESSION_KEY);
-    setSession(null);
-    setJobs([]);
-    setStats({ total: 0, completed: 0, running: 0, malicious: 0 });
-  }, []);
+    return client;
+  }, [handleAuthExpired, session]);
 
   const loadJobs = useCallback(async () => {
     if (!session?.token) {
@@ -114,25 +137,24 @@ export default function AppShell({ children }) {
     }
 
     try {
-      const response = await apiClient.get("/jobs");
+      const response = await apiClient.get("/jobs", { params: { per_page: 100 } });
       const nextJobs = Array.isArray(response.data)
         ? response.data
         : response.data?.jobs || [];
       setJobs(nextJobs);
+      setJobsError("");
       setStats({
-        total: nextJobs.length,
+        total: response.data?.total ?? nextJobs.length,
         completed: nextJobs.filter((job) => statusValue(job.status) === "completed").length,
-        running: nextJobs.filter((job) =>
-          ["ingesting", "queued", "analyzing", "cortex_reasoning"].includes(statusValue(job.status)),
-        ).length,
+        running: nextJobs.filter((job) => ACTIVE_STATUSES.includes(statusValue(job.status))).length,
         malicious: nextJobs.filter((job) => statusValue(job.verdict) === "malicious").length,
       });
     } catch (error) {
-      if (error.response?.status === 401) {
-        handleAuthExpired();
+      if (error.response?.status !== 401) {
+        setJobsError(apiErrorMessage(error, "Could not load your analysis history."));
       }
     }
-  }, [apiClient, handleAuthExpired, session]);
+  }, [apiClient, session]);
 
   useEffect(() => {
     if (session?.token) {
@@ -218,7 +240,17 @@ export default function AppShell({ children }) {
           </div>
         </aside>
 
-        <section className="workspace">{children}</section>
+        <section className="workspace">
+          {jobsError ? (
+            <div className="card">
+              <p className="form-error" role="alert">{jobsError}</p>
+              <button className="ghost-button" onClick={loadJobs} type="button">
+                Retry
+              </button>
+            </div>
+          ) : null}
+          {children}
+        </section>
       </main>
     </SentinelAppContext.Provider>
   );

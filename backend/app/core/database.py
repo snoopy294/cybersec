@@ -18,6 +18,8 @@ engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     connect_args=connect_args,
+    # Hosted Postgres (Neon) closes idle connections; check before reuse.
+    pool_pre_ping=True,
 )
 
 async_session = async_sessionmaker(

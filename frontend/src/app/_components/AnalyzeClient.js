@@ -5,11 +5,11 @@ import { useRouter } from "next/navigation";
 import AnalysisProgress from "./AnalysisProgress";
 import UploadZone from "./UploadZone";
 import { useSentinelApp } from "./AppShell";
-import { reportHashFromUrl } from "../_lib/constants";
+import { apiErrorMessage, reportHashFromUrl } from "../_lib/constants";
 
 export default function AnalyzeClient({ initialJobId }) {
   const router = useRouter();
-  const { apiClient, loadJobs, onAuthExpired } = useSentinelApp();
+  const { apiClient, loadJobs } = useSentinelApp();
   const [uploading, setUploading] = useState(false);
   const [activeJobId, setActiveJobId] = useState(initialJobId || null);
   const [error, setError] = useState("");
@@ -19,6 +19,9 @@ export default function AnalyzeClient({ initialJobId }) {
   }, [initialJobId]);
 
   const handleFileUpload = async (file) => {
+    if (uploading) {
+      return;
+    }
     setUploading(true);
     setError("");
 
@@ -35,11 +38,9 @@ export default function AnalyzeClient({ initialJobId }) {
       router.replace(`/analyze?job=${jobId}`);
       loadJobs();
     } catch (err) {
-      if (err.response?.status === 401) {
-        onAuthExpired();
-      } else {
-        const detail = err.response?.data?.detail;
-        setError(typeof detail === "string" ? detail : "Upload failed");
+      // AppShell handles 401 by signing the person out.
+      if (err.response?.status !== 401) {
+        setError(apiErrorMessage(err, "Upload failed."));
       }
     } finally {
       setUploading(false);
@@ -76,7 +77,6 @@ export default function AnalyzeClient({ initialJobId }) {
             <AnalysisProgress
               apiClient={apiClient}
               jobId={activeJobId}
-              onAuthExpired={onAuthExpired}
               onComplete={handleComplete}
             />
           ) : (

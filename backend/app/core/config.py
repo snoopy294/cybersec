@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 import os
+from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import field_validator, model_validator
@@ -55,16 +56,19 @@ class Settings(BaseSettings):
     ALLOW_REGISTRATION: bool = True  # Set False on hosted deploys once your accounts exist
 
     # ── Upload Limits ────────────────────────────────────────────
-    MAX_FILE_SIZE_MB: int = 100
+    MAX_FILE_SIZE_MB: int = 10
     UPLOAD_READ_CHUNK_SIZE_BYTES: int = 1024 * 1024
     UPLOAD_RATE_LIMIT_PER_MINUTE: int = 5
     AUTH_RATE_LIMIT_PER_MINUTE: int = 10
     RATE_LIMIT_WINDOW_SECONDS: int = 60
+    LOGIN_FAILURES_PER_EMAIL: int = 10  # Failed logins allowed per account per window
+    LOGIN_FAILURE_WINDOW_SECONDS: int = 900
+    TRUSTED_PROXY_HOPS: int = 1  # Proxies in front of the API that append to X-Forwarded-For
     MAX_ACTIVE_JOBS_PER_TENANT: int = 3
     MAX_DAILY_UPLOAD_MB_PER_TENANT: int = 1024
     RETENTION_DAYS: int = 30
     RETENTION_MAX_JOBS_PER_TENANT: int = 250
-    EXPOSE_API_DOCS: bool = True
+    EXPOSE_API_DOCS: Optional[bool] = None  # Defaults to DEBUG
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
@@ -88,6 +92,15 @@ class Settings(BaseSettings):
             else:
                 self.DATABASE_URL_SYNC = self.DATABASE_URL
         return self
+
+    @property
+    def docs_enabled(self) -> bool:
+        return self.DEBUG if self.EXPOSE_API_DOCS is None else self.EXPOSE_API_DOCS
+
+    @property
+    def max_request_body_bytes(self) -> int:
+        # Leave headroom for multipart framing around the file itself.
+        return (self.MAX_FILE_SIZE_MB + 1) * 1024 * 1024
 
     @property
     def cors_origins(self) -> list[str]:

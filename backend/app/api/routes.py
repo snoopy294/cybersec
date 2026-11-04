@@ -9,12 +9,15 @@ Implements the core REST API contracts defined in the architecture specification
   - POST /api/v1/auth/login    — Login and get JWT
 """
 
+import logging
+import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Body, Request
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Body, Request, Path
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc, text
 
@@ -35,6 +38,7 @@ from app.services.file_service import (
     StorageConfigurationError,
     StorageOperationError,
     compute_file_hashes,
+    sanitize_file_name,
     storage_health_status,
     upload_file as store_file,
 )
@@ -54,18 +58,29 @@ from app.services.detection_service import (
 from app.services.graph_service import build_relationship_graph
 
 settings = get_settings()
+logger = logging.getLogger("sentinel.api")
 bearer_scheme = HTTPBearer(auto_error=False)
 rate_limiter = InMemoryRateLimiter()
 
 router = APIRouter(prefix="/api/v1", tags=["SENTINEL API"])
 auth_router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
 
+SHA256_PATTERN = r"^[A-Fa-f0-9]{64}$"
+FileHash = Annotated[str, Path(pattern=SHA256_PATTERN, description="SHA-256 file hash")]
+MAX_FEEDBACK_ITEMS = 200
+ACTIVE_STATUSES = (
+    JobStatus.INGESTING.value,
+    JobStatus.QUEUED.value,
+    JobStatus.ANALYZING.value,
+    JobStatus.CORTEX_REASONING.value,
+)
+
 
 def _latest_report_query(file_hash: str):
     return (
         select(ThreatReport)
         .join(AnalysisJob, ThreatReport.job_id == AnalysisJob.id)
-        .where(ThreatReport.file_hash_sha256 == file_hash)
+        .where(ThreatReport.file_hash_sha256 == file_hash.lower())
         .order_by(desc(ThreatReport.created_at))
         .limit(1)
     )
@@ -80,7 +95,7 @@ def _raise_rate_limit(exc: RateLimitExceeded):
 
 
 def _auth_rate_limit(request: Request, action: str):
-    key = f"auth:{action}:{client_ip_from_request(request)}"
+    key = f"auth:{action}:{client_ip_from_request(request, settings.TRUSTED_PROXY_HOPS)}"
     try:
         rate_limiter.check(
             key,
@@ -126,25 +141,33 @@ async def _read_limited_upload(file: UploadFile) -> bytes:
     return b"".join(chunks)
 
 
-async def _enforce_upload_quotas(db: AsyncSession, tenant_id: UUID, incoming_size: int):
-    active_statuses = (
-        JobStatus.INGESTING.value,
-        JobStatus.QUEUED.value,
-        JobStatus.ANALYZING.value,
-        JobStatus.CORTEX_REASONING.value,
-    )
+def _clean_content_type(content_type: Optional[str]) -> str:
+    value = (content_type or "").split(";", 1)[0].strip().lower()
+    if not value or len(value) > 128 or not all(c.isalnum() or c in "/.+-" for c in value):
+        return "application/octet-stream"
+    return value
+
+
+async def _enforce_active_job_limit(db: AsyncSession, tenant_id: UUID):
     active_result = await db.execute(
         select(func.count()).select_from(AnalysisJob).where(
             AnalysisJob.tenant_id == tenant_id,
-            AnalysisJob.status.in_(active_statuses),
+            AnalysisJob.status.in_(ACTIVE_STATUSES),
         )
     )
     active_count = active_result.scalar() or 0
     if active_count >= settings.MAX_ACTIVE_JOBS_PER_TENANT:
         raise HTTPException(
             status_code=429,
-            detail=f"Upload queue limit reached ({settings.MAX_ACTIVE_JOBS_PER_TENANT} active jobs)",
+            detail=(
+                f"Upload queue limit reached ({settings.MAX_ACTIVE_JOBS_PER_TENANT} active jobs). "
+                "Wait for a running analysis to finish."
+            ),
         )
+
+
+async def _enforce_upload_quotas(db: AsyncSession, tenant_id: UUID, incoming_size: int):
+    await _enforce_active_job_limit(db, tenant_id)
 
     if settings.MAX_DAILY_UPLOAD_MB_PER_TENANT <= 0:
         return
@@ -238,7 +261,7 @@ async def register(request: Request, data: UserRegister, db: AsyncSession = Depe
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    email = str(data.email).lower()
+    email = data.email
 
     # Check if email already exists
     existing = await db.execute(select(User).where(User.email == email))
@@ -246,19 +269,24 @@ async def register(request: Request, data: UserRegister, db: AsyncSession = Depe
         raise HTTPException(status_code=409, detail="Email already registered")
 
     # Create tenant
-    tenant = Tenant(name=data.tenant_name, tier=TenantTier.FREE)
+    tenant = Tenant(name=data.tenant_name, tier=TenantTier.FREE.value)
     db.add(tenant)
-    await db.flush()
 
     # Create user
     user = User(
-        tenant_id=tenant.id,
+        tenant=tenant,
         email=email,
         password_hash=hash_password(data.password),
     )
     db.add(user)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # Two signups for the same email raced past the check above.
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Email already registered") from exc
 
+    logger.info("New account registered (tenant %s)", tenant.id)
     token = create_access_token(user.id, tenant.id)
 
     return TokenResponse(
@@ -272,12 +300,35 @@ async def register(request: Request, data: UserRegister, db: AsyncSession = Depe
 async def login(request: Request, data: UserLogin, db: AsyncSession = Depends(get_db)):
     """Authenticate and return a JWT token."""
     _auth_rate_limit(request, "login")
-    result = await db.execute(select(User).where(User.email == str(data.email).lower()))
+
+    # Per-account lockout, so a password guesser rotating IPs still gets stopped.
+    failure_key = f"auth:login-failures:{data.email}"
+    try:
+        rate_limiter.ensure_allowed(
+            failure_key,
+            settings.LOGIN_FAILURES_PER_EMAIL,
+            settings.LOGIN_FAILURE_WINDOW_SECONDS,
+        )
+    except RateLimitExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed sign-in attempts for this account. Try again later.",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
+
+    result = await db.execute(select(User).where(User.email == data.email))
     user = result.scalar_one_or_none()
 
-    if not user or not user.is_active or not verify_password(data.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    password_ok = verify_password(data.password, user.password_hash if user else None)
+    if not user or not user.is_active or not password_ok:
+        rate_limiter.record(failure_key, settings.LOGIN_FAILURE_WINDOW_SECONDS)
+        logger.warning(
+            "Failed login from %s",
+            client_ip_from_request(request, settings.TRUSTED_PROXY_HOPS),
+        )
+        raise HTTPException(status_code=401, detail="Invalid email or password")
 
+    rate_limiter.reset(failure_key)
     token = create_access_token(user.id, user.tenant_id)
 
     return TokenResponse(
@@ -329,6 +380,8 @@ async def upload_file(
     # Read file bytes in bounded chunks so oversize uploads fail early.
     file_bytes = await _read_limited_upload(file)
     file_size = len(file_bytes)
+    file_name = sanitize_file_name(file.filename)
+    content_type = _clean_content_type(file.content_type)
     await _enforce_upload_quotas(db, current_user.tenant_id, file_size)
 
     # Compute hashes
@@ -363,23 +416,28 @@ async def upload_file(
         object_path = store_file(
             tenant_id=str(current_user.tenant_id),
             sha256_hash=hashes["sha256"],
-            file_name=file.filename or "unknown",
+            file_name=file_name,
             file_bytes=file_bytes,
-            content_type=file.content_type or "application/octet-stream",
+            content_type=content_type,
         )
     except (StorageConfigurationError, StorageOperationError) as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        # The underlying message names buckets and endpoints; keep it in the logs.
+        logger.error("Sample storage failed for tenant %s: %s", current_user.tenant_id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="File storage is temporarily unavailable. Try again in a few minutes.",
+        ) from exc
 
     # Create job record
     job = AnalysisJob(
         tenant_id=current_user.tenant_id,
-        file_name=file.filename or "unknown",
+        file_name=file_name,
         file_size_bytes=file_size,
         file_hash_sha256=hashes["sha256"],
         file_hash_sha1=hashes["sha1"],
         file_hash_md5=hashes["md5"],
-        file_mime_type=file.content_type,
-        status=JobStatus.QUEUED,
+        file_mime_type=content_type,
+        status=JobStatus.QUEUED.value,
         minio_object_path=object_path,
     )
     db.add(job)
@@ -440,7 +498,7 @@ async def get_job_status(
 async def list_jobs(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
-    status: Optional[str] = Query(None),
+    status: Optional[str] = Query(None, max_length=32),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -449,10 +507,11 @@ async def list_jobs(
 
     if status:
         try:
-            status_enum = JobStatus(status)
-            query = query.where(AnalysisJob.status == status_enum)
+            status_enum = JobStatus(status.upper())
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+            allowed = ", ".join(s.value.lower() for s in JobStatus)
+            raise HTTPException(status_code=400, detail=f"Invalid status filter. Use one of: {allowed}")
+        query = query.where(AnalysisJob.status == status_enum.value)
 
     # Get total count
     count_query = select(func.count()).select_from(query.subquery())
@@ -490,7 +549,7 @@ async def list_jobs(
 
 @router.get("/report/{file_hash}", response_model=ThreatReportResponse)
 async def get_report(
-    file_hash: str,
+    file_hash: FileHash,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -520,15 +579,18 @@ async def get_report(
 
 @router.post("/report/{file_hash}/refresh", response_model=AnalysisJobResponse, status_code=202)
 async def refresh_report(
-    file_hash: str,
+    file_hash: FileHash,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Queue a fresh analysis run for an existing uploaded file."""
+    _upload_rate_limit(current_user)
+    await _enforce_active_job_limit(db, current_user.tenant_id)
+
     result = await db.execute(
         select(AnalysisJob)
         .where(
-            AnalysisJob.file_hash_sha256 == file_hash,
+            AnalysisJob.file_hash_sha256 == file_hash.lower(),
             AnalysisJob.tenant_id == current_user.tenant_id,
         )
         .order_by(desc(AnalysisJob.created_at))
@@ -546,7 +608,7 @@ async def refresh_report(
         file_hash_sha1=source_job.file_hash_sha1,
         file_hash_md5=source_job.file_hash_md5,
         file_mime_type=source_job.file_mime_type,
-        status=JobStatus.QUEUED,
+        status=JobStatus.QUEUED.value,
         minio_object_path=source_job.minio_object_path,
     )
     db.add(refresh_job)
@@ -567,7 +629,7 @@ async def refresh_report(
 
 @router.get("/report/{file_hash}/similar", response_model=BehaviorSimilarityResponse)
 async def get_behavior_similarity(
-    file_hash: str,
+    file_hash: FileHash,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -595,7 +657,7 @@ async def get_behavior_similarity(
 
 @router.post("/report/{file_hash}/detections", response_model=DetectionPackResponse)
 async def generate_detection_pack(
-    file_hash: str,
+    file_hash: FileHash,
     payload: Optional[DetectionPackRequest] = Body(default=None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -624,7 +686,7 @@ async def generate_detection_pack(
 
 @router.post("/report/{file_hash}/feedback", response_model=AnalystFeedbackResponse)
 async def submit_analyst_feedback(
-    file_hash: str,
+    file_hash: FileHash,
     payload: AnalystFeedbackRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -649,6 +711,8 @@ async def submit_analyst_feedback(
     static_data = dict(report.static_data or {})
     feedback_items = list(static_data.get("analyst_feedback") or [])
     feedback_items.append(feedback)
+    # Keep the report row bounded; the newest feedback matters most.
+    feedback_items = feedback_items[-MAX_FEEDBACK_ITEMS:]
     static_data["analyst_feedback"] = feedback_items
 
     event_log = list(static_data.get("event_log") or [])
@@ -671,8 +735,8 @@ async def submit_analyst_feedback(
 
 @router.get("/graph/relationships", response_model=GraphRelationshipResponse)
 async def get_graph_relationships(
-    entity_type: str = Query(...),
-    entity_id: str = Query(...),
+    entity_type: str = Query(..., max_length=16),
+    entity_id: str = Query(..., min_length=1, max_length=512),
     depth: int = Query(1, ge=1, le=2),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -683,6 +747,8 @@ async def get_graph_relationships(
         raise HTTPException(status_code=400, detail="entity_type must be file, behavior, or ioc")
 
     if normalized_type == "file":
+        if not re.fullmatch(SHA256_PATTERN, entity_id):
+            raise HTTPException(status_code=400, detail="entity_id must be a SHA-256 hash for file lookups")
         result = await db.execute(
             _latest_report_query(entity_id).where(AnalysisJob.tenant_id == current_user.tenant_id)
         )

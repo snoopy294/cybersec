@@ -13,6 +13,7 @@ Supports two modes:
 
 import hashlib
 import json
+import logging
 import re
 import struct
 import threading
@@ -32,10 +33,16 @@ except ImportError:  # pragma: no cover - fallback keeps local dev usable before
     pefile = None
 
 settings = get_settings()
+logger = logging.getLogger("sentinel.worker")
 ANALYZER_VERSION = "behavior-v5"
 
 # Synchronous DB session for the analysis worker
-sync_engine = create_engine(settings.DATABASE_URL_SYNC, connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL_SYNC else {})
+# pool_pre_ping: hosted Postgres (Neon) closes idle connections between jobs.
+sync_engine = create_engine(
+    settings.DATABASE_URL_SYNC,
+    connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL_SYNC else {},
+    pool_pre_ping=True,
+)
 SyncSession = sessionmaker(bind=sync_engine)
 
 
@@ -802,6 +809,11 @@ def _find_behavior_matches(session, current_job, static_data: dict, iocs_dict: d
 
 # ── Core Analysis Function ───────────────────────────────────────
 
+# Shown to users; the underlying exception only goes to the server log.
+SAMPLE_UNREADABLE_MESSAGE = "The uploaded file could not be read from storage. Upload it again."
+ANALYSIS_FAILED_MESSAGE = "Analysis failed unexpectedly. Use Refresh analysis to retry."
+INTERRUPTED_MESSAGE = "Analysis was interrupted by a server restart. Use Refresh analysis to retry."
+
 def run_analysis(job_id: str):
     """Process a file through the static analysis pipeline.
 
@@ -814,21 +826,22 @@ def run_analysis(job_id: str):
     try:
         job = session.query(AnalysisJob).filter_by(id=job_id).first()
         if not job:
-            print(f"[SENTINEL] Job {job_id} not found")
+            logger.warning("Job %s not found", job_id)
             return {"error": f"Job {job_id} not found"}
 
         # ── Stage 1: Update status ───────────────────────────────
         job.status = JobStatus.ANALYZING
         job.progress_percent = 10
         session.commit()
-        print(f"[SENTINEL] Analyzing: {job.file_name}")
+        logger.info("Analyzing job %s", job_id)
 
         # ── Stage 2: Download file ───────────────────────────────
         try:
             file_data = download_file(job.minio_object_path)
         except Exception as e:
+            logger.exception("Job %s could not read its stored sample", job_id)
             job.status = JobStatus.FAILED
-            job.error_message = f"Failed to read file: {str(e)}"
+            job.error_message = SAMPLE_UNREADABLE_MESSAGE
             session.commit()
             return {"error": str(e)}
 
@@ -1066,7 +1079,7 @@ def run_analysis(job_id: str):
         job.completed_at = datetime.now(timezone.utc)
         session.commit()
 
-        print(f"[SENTINEL] COMPLETE: {job.file_name} -> {verdict.value} (score: {score})")
+        logger.info("Job %s complete: %s (score %s)", job_id, verdict.value, score)
         return {"job_id": job_id, "verdict": verdict.value, "severity_score": score}
 
     except Exception as e:
@@ -1075,11 +1088,11 @@ def run_analysis(job_id: str):
             job = session.query(AnalysisJob).filter_by(id=job_id).first()
             if job:
                 job.status = JobStatus.FAILED
-                job.error_message = str(e)
+                job.error_message = ANALYSIS_FAILED_MESSAGE
                 session.commit()
         except Exception:
-            pass
-        print(f"[SENTINEL] FAILED: {e}")
+            logger.exception("Job %s could not be marked as failed", job_id)
+        logger.exception("Job %s failed", job_id)
         raise
     finally:
         session.close()

@@ -29,6 +29,15 @@ services:
         generateValue: true
       - key: USE_CELERY
         value: false
-      # Create your accounts first, then flip this to false and redeploy.
+      # Set in the dashboard: true only while creating your accounts, then false.
+      # sync: false keeps a Blueprint sync from reopening signups.
       - key: ALLOW_REGISTRATION
-        value: true
+        sync: false
+      - key: EXPOSE_API_DOCS
+        value: false
+      # Keep in step with the frontend proxy body cap in next.config.js.
+      - key: MAX_FILE_SIZE_MB
+        value: 10
+      # Render's proxy is the one hop in front of the API.
+      - key: TRUSTED_PROXY_HOPS
+        value: 1

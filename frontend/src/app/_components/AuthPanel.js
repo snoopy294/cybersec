@@ -2,7 +2,9 @@
 
 import { useState } from "react";
 import axios from "axios";
-import { API_BASE } from "../_lib/constants";
+import { API_BASE, API_TIMEOUT_MS, apiErrorMessage, passwordProblems } from "../_lib/constants";
+
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 export default function AuthPanel({ onAuthenticated }) {
   const [mode, setMode] = useState("login");
@@ -10,21 +12,56 @@ export default function AuthPanel({ onAuthenticated }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
+  const validate = () => {
+    const email = form.email.trim();
+    if (!EMAIL_RE.test(email)) {
+      return "Enter a valid email address.";
+    }
+    if (mode === "register") {
+      if (!form.name.trim()) {
+        return "Enter your name.";
+      }
+      const problems = passwordProblems(form.password);
+      if (problems.length) {
+        return `Password needs ${problems.join(", ")}.`;
+      }
+    } else if (!form.password) {
+      return "Enter your password.";
+    }
+    return "";
+  };
+
+  const switchMode = (nextMode) => {
+    setMode(nextMode);
+    setError("");
+  };
+
   const handleSubmit = async (event) => {
     event.preventDefault();
-    setError("");
+    if (loading) {
+      return;
+    }
+
+    const problem = validate();
+    setError(problem);
+    if (problem) {
+      return;
+    }
     setLoading(true);
 
     try {
       const endpoint = mode === "register" ? "/auth/register" : "/auth/login";
       const payload =
         mode === "register"
-          ? { email: form.email, password: form.password, tenant_name: form.name }
-          : { email: form.email, password: form.password };
-      const response = await axios.post(`${API_BASE}${endpoint}`, payload);
+          ? { email: form.email.trim(), password: form.password, tenant_name: form.name.trim() }
+          : { email: form.email.trim(), password: form.password };
+      const response = await axios.post(`${API_BASE}${endpoint}`, payload, {
+        timeout: API_TIMEOUT_MS,
+      });
       const token = response.data.access_token;
       const profile = await axios.get(`${API_BASE}/auth/me`, {
         headers: { Authorization: `Bearer ${token}` },
+        timeout: API_TIMEOUT_MS,
       });
       onAuthenticated({
         token,
@@ -41,8 +78,9 @@ export default function AuthPanel({ onAuthenticated }) {
         },
       });
     } catch (err) {
-      const detail = err.response?.data?.detail;
-      setError(typeof detail === "string" ? detail : "Authentication failed");
+      setError(
+        apiErrorMessage(err, mode === "register" ? "Could not create the account." : "Could not sign in."),
+      );
     } finally {
       setLoading(false);
     }
@@ -78,25 +116,27 @@ export default function AuthPanel({ onAuthenticated }) {
         <div className="auth-tabs">
           <button
             className={mode === "login" ? "active" : ""}
-            onClick={() => setMode("login")}
+            onClick={() => switchMode("login")}
             type="button"
           >
             Sign in
           </button>
           <button
             className={mode === "register" ? "active" : ""}
-            onClick={() => setMode("register")}
+            onClick={() => switchMode("register")}
             type="button"
           >
             Create account
           </button>
         </div>
 
-        <form onSubmit={handleSubmit}>
+        <form noValidate onSubmit={handleSubmit}>
           {mode === "register" ? (
             <label>
               Name
               <input
+                autoComplete="name"
+                maxLength={100}
                 value={form.name}
                 onChange={(event) =>
                   setForm((current) => ({ ...current, name: event.target.value }))
@@ -110,6 +150,8 @@ export default function AuthPanel({ onAuthenticated }) {
           <label>
             Email
             <input
+              autoComplete="email"
+              maxLength={320}
               type="email"
               value={form.email}
               onChange={(event) =>
@@ -123,6 +165,8 @@ export default function AuthPanel({ onAuthenticated }) {
           <label>
             Password
             <input
+              autoComplete={mode === "register" ? "new-password" : "current-password"}
+              maxLength={128}
               type="password"
               value={form.password}
               onChange={(event) =>
@@ -133,7 +177,13 @@ export default function AuthPanel({ onAuthenticated }) {
             />
           </label>
 
-          {error ? <p className="form-error">{error}</p> : null}
+          {mode === "register" ? (
+            <p className="muted">
+              12+ characters, using at least three of: lowercase, uppercase, number, symbol.
+            </p>
+          ) : null}
+
+          {error ? <p className="form-error" role="alert">{error}</p> : null}
 
           <button className="primary-button full" disabled={loading} type="submit">
             {loading

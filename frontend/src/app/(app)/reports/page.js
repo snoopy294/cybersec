@@ -4,8 +4,18 @@ import Link from "next/link";
 import { useMemo, useState } from "react";
 import { useSentinelApp } from "../../_components/AppShell";
 import ReportsTable from "../../_components/ReportsTable";
+import { ACTIVE_STATUSES } from "../../_lib/constants";
 
 const filters = ["all", "queued", "running", "completed", "failed"];
+
+// The API returns uppercase statuses; "running" covers every in-progress stage.
+function matchesFilter(job, filter) {
+  const status = String(job.status || "").toLowerCase();
+  if (filter === "running") {
+    return ACTIVE_STATUSES.includes(status) && status !== "queued";
+  }
+  return status === filter;
+}
 
 export default function ReportsPage() {
   const { jobs } = useSentinelApp();
@@ -16,7 +26,7 @@ export default function ReportsPage() {
       return jobs;
     }
 
-    return jobs.filter((job) => job.status === filter);
+    return jobs.filter((job) => matchesFilter(job, filter));
   }, [filter, jobs]);
 
   return (
