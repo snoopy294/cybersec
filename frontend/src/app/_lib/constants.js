@@ -1,6 +1,6 @@
 export const API_BASE = "/api/v1";
 export const SESSION_KEY = "sentinel_session";
-export const MAX_UPLOAD_SIZE_MB = 10;
+export const MAX_UPLOAD_SIZE_MB = 12;
 export const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024;
 // Render's free tier can take up to a minute to wake, so allow for a cold start.
 export const API_TIMEOUT_MS = 90_000;

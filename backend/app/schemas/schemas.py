@@ -125,6 +125,7 @@ class JobListResponse(BaseModel):
 
 class ThreatReportResponse(BaseModel):
     id: UUID
+    file_name: Optional[str] = None
     file_hash_sha256: str
     severity_score: int
     verdict: Verdict

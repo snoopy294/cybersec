@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     ALLOW_REGISTRATION: bool = True  # Set False on hosted deploys once your accounts exist
 
     # ── Upload Limits ────────────────────────────────────────────
-    MAX_FILE_SIZE_MB: int = 10
+    MAX_FILE_SIZE_MB: int = 12
     UPLOAD_READ_CHUNK_SIZE_BYTES: int = 1024 * 1024
     UPLOAD_RATE_LIMIT_PER_MINUTE: int = 5
     AUTH_RATE_LIMIT_PER_MINUTE: int = 10

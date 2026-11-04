@@ -37,9 +37,9 @@ const nextConfig = {
 
   experimental: {
     // The /api proxy truncates request bodies past this size (10MB by default).
-    // Uploads are capped at 10MB (MAX_UPLOAD_SIZE_MB); this leaves room for
+    // Uploads are capped at 12MB (MAX_UPLOAD_SIZE_MB); this leaves room for
     // multipart framing so the backend can answer with a proper 413.
-    middlewareClientMaxBodySize: '12mb',
+    middlewareClientMaxBodySize: '14mb',
   },
 
   async headers() {
