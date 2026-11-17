@@ -1,4 +1,6 @@
 from app.worker import (
+    BEHAVIOR_RULES,
+    _build_behavior_profile,
     _classify_string,
     _compute_entropy,
     _extract_strings,
@@ -62,3 +64,22 @@ def test_pe_summary_excludes_nested_report_tables():
     summary = _pe_summary_for_report(pe_info)
 
     assert summary == {"is_pe": True, "machine": "x64"}
+
+
+def test_run_key_persistence_maps_to_current_attack_technique():
+    strings = [{
+        "value": r"Software\Microsoft\Windows\CurrentVersion\Run",
+        "classification": "REGISTRY_KEY",
+    }]
+
+    profile = _build_behavior_profile(strings, {}, 0.0, None)
+
+    persistence = next(c for c in profile["capabilities"] if c["name"] == "persistence")
+    assert "T1547.001" in persistence["mitre"]
+    assert "T1547.001" in profile["mitre"]
+    assert "T1060" not in profile["mitre"]
+
+
+def test_behavior_rules_do_not_use_deprecated_t1060():
+    for rule in BEHAVIOR_RULES.values():
+        assert "T1060" not in rule["mitre"]

@@ -5,6 +5,7 @@ The autonomous threat intelligence platform API server.
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -30,22 +31,27 @@ logger = logging.getLogger("sentinel")
 
 
 async def recover_interrupted_jobs() -> int:
-    """Fail jobs whose background thread died with the previous process.
+    """Fail jobs whose analysis died with the previous process.
 
     In thread mode a restart (deploy, crash, free-tier sleep) kills running
     analyses, which would otherwise sit in an active status forever and count
-    against the tenant's active-job limit.
-    """
-    if settings.USE_CELERY:
-        return 0
+    against the tenant's active-job limit, so every active job is failed.
 
+    In Celery mode the jobs live in Redis and on the workers, not in this
+    process, so an API restart must not fail them. Only jobs older than
+    CELERY_STALE_JOB_MINUTES are failed: by then the task has either run or
+    been lost (Redis flushed, or the API died before enqueueing it).
+    """
     from app.worker import INTERRUPTED_MESSAGE
+
+    query = update(AnalysisJob).where(AnalysisJob.status.in_(ACTIVE_STATUSES))
+    if settings.USE_CELERY:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.CELERY_STALE_JOB_MINUTES)
+        query = query.where(AnalysisJob.created_at < cutoff)
 
     async with async_session() as session:
         result = await session.execute(
-            update(AnalysisJob)
-            .where(AnalysisJob.status.in_(ACTIVE_STATUSES))
-            .values(status=JobStatus.FAILED.value, error_message=INTERRUPTED_MESSAGE)
+            query.values(status=JobStatus.FAILED.value, error_message=INTERRUPTED_MESSAGE)
         )
         await session.commit()
     return result.rowcount or 0
@@ -55,6 +61,8 @@ async def recover_interrupted_jobs() -> int:
 async def lifespan(app: FastAPI):
     """Application lifespan — create tables on startup."""
     validate_runtime_security(settings)
+    if settings.USE_CELERY and not settings.REDIS_URL:
+        raise RuntimeError("USE_CELERY=true requires REDIS_URL for the Celery broker")
     validate_storage_configuration()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

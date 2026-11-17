@@ -181,6 +181,9 @@ class DetectionRuleResponse(BaseModel):
     format: str
     name: str
     confidence: float
+    # What the confidence was computed from: item count, kinds, summed
+    # strength, and the capabilities that corroborate the evidence.
+    confidence_basis: Optional[dict] = None
     validation_status: str
     evidence: List[str] = Field(default_factory=list)
     content: Any

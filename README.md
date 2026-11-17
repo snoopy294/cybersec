@@ -43,7 +43,8 @@ cyber/
 │   │   ├── models/       # SQLAlchemy ORM models
 │   │   ├── schemas/      # Pydantic request/response schemas
 │   │   ├── services/     # Business logic (file storage, auth)
-│   │   ├── worker.py     # Celery analysis pipeline
+│   │   ├── worker.py     # Analysis pipeline and dispatch (thread or Celery)
+│   │   ├── celery_worker.py  # Celery app and analyze_file_task
 │   │   └── main.py       # FastAPI app entry point
 │   ├── Dockerfile
 │   └── requirements.txt

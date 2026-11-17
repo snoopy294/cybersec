@@ -47,7 +47,17 @@ class Settings(BaseSettings):
 
     # ── Redis (optional — runs sync mode without it) ─────────────
     REDIS_URL: str = ""
-    USE_CELERY: bool = False  # Set True if Redis + Celery are available
+    USE_CELERY: bool = False  # True runs analysis on Celery workers (needs REDIS_URL)
+
+    # ── Celery (only used if USE_CELERY=true) ────────────────────
+    CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: int = 300  # Job is marked FAILED at this point
+    CELERY_TASK_TIME_LIMIT_SECONDS: int = 360  # Worker process is killed at this point
+    CELERY_MAX_RETRIES: int = 3  # Retries for transient storage errors only
+    CELERY_RETRY_BACKOFF_SECONDS: int = 5  # First retry delay; doubles each retry
+    CELERY_RETRY_BACKOFF_MAX_SECONDS: int = 120
+    # Startup recovery fails active jobs older than this; younger ones are
+    # assumed to still be queued or running in Celery.
+    CELERY_STALE_JOB_MINUTES: int = 60
 
     # ── Auth ─────────────────────────────────────────────────────
     SECRET_KEY: str = "sentinel-dev-secret-change-in-production-2026"  # ⚠ CHANGE THIS in .env for production!

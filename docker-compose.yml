@@ -83,6 +83,7 @@ services:
       MINIO_SECRET_KEY: sentinel_minio_2026
       MINIO_BUCKET: sentinel-payloads
       MINIO_SECURE: "false"
+      USE_CELERY: "true"
     volumes:
       - ./backend/app:/app/app
     depends_on:
@@ -99,7 +100,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: sentinel-celery-worker
-    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=4
+    command: celery -A app.celery_worker:celery_app worker --loglevel=info --concurrency=4
     environment:
       DATABASE_URL: postgresql+asyncpg://sentinel:sentinel_dev_2026@postgres:5432/sentinel_db
       DATABASE_URL_SYNC: postgresql://sentinel:sentinel_dev_2026@postgres:5432/sentinel_db
@@ -110,6 +111,7 @@ services:
       MINIO_SECRET_KEY: sentinel_minio_2026
       MINIO_BUCKET: sentinel-payloads
       MINIO_SECURE: "false"
+      USE_CELERY: "true"
     volumes:
       - ./backend/app:/app/app
     depends_on:
@@ -117,18 +119,17 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
 
   # ── Celery Flower (Monitoring) ─────────────────────────────────
+  # Flower only needs the broker, so it runs from its own image.
   celery-flower:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: mher/flower:2.1.0
     container_name: sentinel-flower
-    command: celery -A app.worker.celery_app flower --port=5555
+    command: celery --broker=redis://redis:6379/0 flower --port=5555
     ports:
       - "5555:5555"
-    environment:
-      REDIS_URL: redis://redis:6379/0
     depends_on:
       redis:
         condition: service_healthy
