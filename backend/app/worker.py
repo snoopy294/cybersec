@@ -7,8 +7,8 @@ Runs static analysis on uploaded files:
   - Automated threat scoring
 
 Supports two modes:
-  - Synchronous (default): Runs in a background thread, no Redis/Celery needed
-  - Celery (optional): Distributed via Redis broker
+  - Background thread (default): runs inside the API process, no Redis needed
+  - Celery (USE_CELERY=true): app.celery_worker runs jobs on workers via Redis
 """
 
 import hashlib
@@ -28,7 +28,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import get_settings
-from app.services.file_service import download_file
+from app.services.file_service import TransientStorageError, download_file
 
 try:
     import pefile
@@ -1156,11 +1156,19 @@ SAMPLE_UNREADABLE_MESSAGE = "The uploaded file could not be read from storage. U
 ANALYSIS_FAILED_MESSAGE = "Analysis failed unexpectedly. Use Refresh analysis to retry."
 INTERRUPTED_MESSAGE = "Analysis was interrupted by a server restart. Use Refresh analysis to retry."
 
-def run_analysis(job_id: str):
+def run_analysis(job_id: str, *, raise_transient: bool = False):
     """Process a file through the static analysis pipeline.
 
     This function runs synchronously and is designed to be called
     either directly in a background thread or via Celery.
+
+    It is safe to run more than once for the same job (Celery redelivers
+    with acks_late): a COMPLETED job returns immediately, and the report is
+    upserted, so a re-run never duplicates it.
+
+    With raise_transient=True a retryable storage error is re-raised for the
+    caller to retry, and the job goes back to QUEUED. Otherwise the job is
+    marked FAILED as for any other unreadable sample.
     """
     from app.models.models import AnalysisJob, ThreatReport, JobStatus, Verdict
 
@@ -1170,6 +1178,9 @@ def run_analysis(job_id: str):
         if not job:
             logger.warning("Job %s not found", job_id)
             return {"error": f"Job {job_id} not found"}
+        if job.status == JobStatus.COMPLETED:
+            logger.info("Job %s already completed; skipping re-run", job_id)
+            return {"job_id": job_id, "status": "already_completed"}
 
         # ── Stage 1: Update status ───────────────────────────────
         job.status = JobStatus.ANALYZING
@@ -1181,6 +1192,12 @@ def run_analysis(job_id: str):
         try:
             file_data = download_file(job.minio_object_path)
         except Exception as e:
+            if raise_transient and isinstance(e, TransientStorageError):
+                logger.warning("Job %s hit a transient storage error; will retry: %s", job_id, e)
+                job.status = JobStatus.QUEUED
+                job.progress_percent = 0
+                session.commit()
+                raise
             logger.exception("Job %s could not read its stored sample", job_id)
             job.status = JobStatus.FAILED
             job.error_message = SAMPLE_UNREADABLE_MESSAGE
@@ -1455,6 +1472,10 @@ def run_analysis(job_id: str):
         logger.info("Job %s complete: %s (score %s)", job_id, verdict.value, score)
         return {"job_id": job_id, "verdict": verdict.value, "severity_score": score}
 
+    except TransientStorageError:
+        # Only re-raised when raise_transient=True; the job is already back in
+        # QUEUED, so don't mark it FAILED on the way out.
+        raise
     except Exception as e:
         session.rollback()
         try:
@@ -1474,12 +1495,16 @@ def run_analysis(job_id: str):
 # ── Dispatch: Background Thread (default) or Celery ──────────────
 
 def dispatch_analysis(job_id: str):
-    """Dispatch analysis — uses background thread by default, Celery if configured."""
+    """Dispatch analysis — uses background thread by default, Celery if configured.
+
+    Returns the Celery AsyncResult, or the started thread in thread mode.
+    """
     if settings.USE_CELERY:
-        # Lazy import Celery task to avoid import errors when Redis isn't available
+        # Lazy import so thread mode never needs Celery or Redis.
         from app.celery_worker import analyze_file_task
-        analyze_file_task.delay(job_id)
-    else:
-        # Run in background thread (no Redis/Celery required)
-        thread = threading.Thread(target=run_analysis, args=(job_id,), daemon=True)
-        thread.start()
+        return analyze_file_task.delay(job_id)
+
+    # Run in background thread (no Redis/Celery required)
+    thread = threading.Thread(target=run_analysis, args=(job_id,), daemon=True)
+    thread.start()
+    return thread

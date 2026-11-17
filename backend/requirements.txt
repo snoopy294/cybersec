@@ -7,6 +7,9 @@ python-multipart>=0.0.9
 pefile>=2024.8.26
 pypdf>=6.0
 
+# ── Task queue ───────────────────────────────────────────────────
+celery[redis]==5.7.0
+
 # ── Database ─────────────────────────────────────────────────────
 sqlalchemy[asyncio]>=2.0.35
 aiosqlite>=0.20.0

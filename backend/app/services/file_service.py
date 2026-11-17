@@ -22,6 +22,36 @@ class StorageOperationError(RuntimeError):
     """Raised when a storage backend cannot complete an operation."""
 
 
+class TransientStorageError(StorageOperationError):
+    """A storage failure that may succeed if retried (network, timeout, 5xx)."""
+
+
+# S3 error codes that mean "try again later" rather than "this will never work".
+_TRANSIENT_S3_CODES = {
+    "InternalError",
+    "RequestTimeout",
+    "ServiceUnavailable",
+    "SlowDown",
+    "RequestTimeTooSkewed",
+}
+
+
+def _is_transient_storage_error(exc: BaseException) -> bool:
+    """Classify an object-storage client error as retryable or not.
+
+    Missing objects, bad credentials and other 4xx answers are permanent;
+    connection problems, timeouts and 5xx answers are worth retrying.
+    """
+    from minio.error import S3Error, ServerError
+    from urllib3.exceptions import HTTPError as Urllib3HTTPError
+
+    if isinstance(exc, ServerError):
+        return True
+    if isinstance(exc, S3Error):
+        return exc.code in _TRANSIENT_S3_CODES
+    return isinstance(exc, (Urllib3HTTPError, ConnectionError, TimeoutError))
+
+
 def compute_file_hashes(file_bytes: bytes) -> dict:
     """Compute SHA-256, SHA-1, and MD5 hashes for a file."""
     return {
@@ -206,13 +236,14 @@ def _download_from_minio(object_path):
     client = _minio_client()
     try:
         response = client.get_object(settings.MINIO_BUCKET, object_path)
+        try:
+            return response.read()
+        finally:
+            response.close()
+            response.release_conn()
     except Exception as exc:
-        raise StorageOperationError(f"Failed to download object '{object_path}': {exc}") from exc
-    try:
-        return response.read()
-    finally:
-        response.close()
-        response.release_conn()
+        error = TransientStorageError if _is_transient_storage_error(exc) else StorageOperationError
+        raise error(f"Failed to download object '{object_path}': {exc}") from exc
 
 
 def _delete_from_minio(object_path):
