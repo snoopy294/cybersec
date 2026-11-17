@@ -432,7 +432,7 @@ BEHAVIOR_RULES = {
             "schtasks", "createservice", "openservice", "startservice",
             "setwindowshookex", "runservices",
         ],
-        "mitre": ["T1060", "T1053", "T1543"],
+        "mitre": ["T1547.001", "T1053", "T1543"],
         "label": "Persistence through startup, scheduled task, or service hooks",
     },
     "process_injection": {
